@@ -1,0 +1,9 @@
+**/target
+**/Cargo.lock
+**/.idea
+**/.tmp
+**/.vs
+**/.vscode
+**/.zed
+**/__pycache__
+**/*.pyc
