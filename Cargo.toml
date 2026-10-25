@@ -8,14 +8,11 @@ license = "AGPL-3.0-or-later"
 
 [features]
 default = []
-# 方案 D：拥塞位 + 仅 async 慢路径取方向锁。默认关闭（方案 C）。
-hybrid = []
 
 [dependencies]
 # 依赖指向 Gitee 的默认分支；发布前应加 rev（或提交 Cargo.lock）固定版本。
 # 注意：本机 cargo git db 只读时，离线构建需要已缓存的 checkout。
 abs_cancel = { git = "https://gitee.com/lino_snsalias/cancel_rs.git" }
-atomic_sync = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git" }
 gen_mcf2 = { git = "https://gitee.com/lino_snsalias/cancel_rs.git" }
 
 [dev-dependencies]

@@ -1,15 +1,9 @@
 //! 通道层测试：构造/复用、关闭/drain、异步满/空唤醒、取消、克隆计数。
 
-use alloc::{alloc::Global, boxed::Box, vec::Vec};
-use core::sync::atomic::AtomicUsize;
+use alloc::{boxed::Box, vec::Vec};
 
 use abs_cancel::{CancelledToken, NonCancellableToken, TrMayCancel};
 use futures_lite::future::block_on;
-
-use atomic_sync::{
-    rwlock::cooperative_arena::CooperativeRwLockOwned,
-    x_deps::atomex::StrictOrderings,
-};
 
 use crate::{MpmcBuf, MpmcChan, RecvError, SendError, TryRecvError, TrySendError};
 
@@ -185,10 +179,10 @@ fn async_empty_wakes_() {
     assert_eq!(consumer.join().expect("consumer 线程不应 panic"), 7);
 }
 
-/// 测试目标：已经取消的令牌必须在接触方向锁之前返回 Cancelled(item)。
+/// 测试目标：已经取消的令牌必须在接触等待队列之前返回 Cancelled(item)。
 /// 手段：填满容量 2，用 CancelledToken 调用 send_async(3).may_cancel_with(...)。
-/// 判断：返回 SendError::Cancelled(3)；随后仍可正常 drain 1/2，说明没有占用/破坏环。
-/// Test goal: an already-cancelled token returns Cancelled(item) before touching locks.
+/// 判断：返回 SendError::Cancelled(3)；随后仍可正常 drain 1/2，说明没有破坏环。
+/// Test goal: an already-cancelled token returns Cancelled(item) before touching the wait queue.
 /// Method: fill capacity 2, call send_async(3) with CancelledToken.
 /// Assertion: returns SendError::Cancelled(3); queued 1/2 remain drainable.
 #[test]
@@ -322,11 +316,9 @@ fn handles_are_send_sync_() {
     assert_send_sync::<crate::MpmcChan<'static, u32, 4, MpmcBuf<u32, 4>>>();
     assert_send_sync::<crate::Sender<'static, u32, 4, MpmcBuf<u32, 4>>>();
     assert_send_sync::<crate::Receiver<'static, u32, 4, MpmcBuf<u32, 4>>>();
-    // NOTE: 在 `TrConfig` 用 GAT 指定锁类型后，`SendFuture`/`RecvFuture` 的
-    // 编译期 `Send` 断言会触发 rustc #100013（higher-ranked lifetime bound not
-    // satisfied）。句柄/内核的 `Send+Sync` 断言保留；Future 的实际 `Send` 由锁
-    // GAT 的 `Send + Sync` 约束与 `MpmcChan` 的自动推导保证，等 rustc 修复该
-    // 限制后再恢复 Future 断言。
+    // NOTE: `SendFuture`/`RecvFuture` 现在持有 `WaitGuard`（&WaitQueue + SlotPtr）。
+    // 句柄/内核的 `Send+Sync` 断言保留在这里；Future 的编译期断言需要展开
+    // `gen_mcf2` 生成的类型参数，后续单独补充。
 }
 
 /// 测试目标：验证 `RecvError` 在关闭后的异步接收路径上正确返回。
@@ -346,54 +338,112 @@ fn async_recv_closed_() {
     );
 }
 
-/// 测试目标：验证自定义 `TrConfig` 的 allocator 与自旋预算可被通道采用。
-/// 手段：定义 `Spin32Config`（复用默认 allocator，`FAST_SPIN = 32`），用
-///       `new_in` 构造容量 4 的通道，跑一次 try 往返与两次 async 往返。
-/// 判断：`FAST_SPIN == 32`；try/async 发送接收值正确；关闭后 recv 返回 `Closed`。
-/// Test goal: verify a custom TrConfig supplies the allocator and spin budget.
-/// Method: define Spin32Config (default allocator, FAST_SPIN = 32), build a
-///         capacity-4 channel via new_in, run try and async roundtrips.
-/// Assertion: FAST_SPIN == 32; values match; closed recv returns Closed.
+/// 测试目标：验证自定义 `TrConfig` 的 allocator、chunk 大小与自旋预算可被通道采用。
+/// 手段：定义 `Spin32Config`（复用默认 allocator，两个方向都用 4 KiB chunk，
+///       `FAST_SPIN = 32`），用 `new_in` 构造容量 4 的通道，跑一次 try 往返与两次
+///       async 往返。
+/// 判断：`FAST_SPIN == 32`、chunk 常量等于 4 KiB；try/async 发送接收值正确；
+///       关闭后 recv 返回 `Closed`。
+/// Test goal: verify a custom TrConfig supplies the allocator, chunk sizes and spin budget.
+/// Method: define Spin32Config (default allocator, 4 KiB chunks, FAST_SPIN = 32),
+///         build a capacity-4 channel via new_in, run try and async roundtrips.
+/// Assertion: FAST_SPIN is 32 and chunk constants are 4 KiB; values match; closed recv is Closed.
 #[test]
 fn custom_config_() {
-    use crate::{DefaultConfig, TrConfig};
+    use crate::{DefaultConfig, TrConfig, TrSlabConfig, WaitSlab4K};
+
+    type ChanAlloc = <DefaultConfig as TrConfig>::ChanAlloc;
 
     struct Spin32Config;
     impl TrConfig for Spin32Config {
-        type ChanAlloc = <DefaultConfig as TrConfig>::ChanAlloc;
-        type ProdGate<'a>
-            = <DefaultConfig as TrConfig>::ProdGate<'a>
-        where
-            Self: 'a;
-        type ConsGate<'a>
-            = <DefaultConfig as TrConfig>::ConsGate<'a>
-        where
-            Self: 'a;
+        type ChanAlloc = ChanAlloc;
+        type ProdWaitSlab = WaitSlab4K<ChanAlloc>;
+        type ConsWaitSlab = WaitSlab4K<ChanAlloc>;
         const FAST_SPIN: usize = 32;
     }
 
     assert_eq!(Spin32Config::FAST_SPIN, 32);
+    assert_eq!(<Spin32Config as TrConfig>::ProdWaitSlab::CHUNK_SIZE, 4096);
+    assert_eq!(<Spin32Config as TrConfig>::ConsWaitSlab::CHUNK_SIZE, 4096);
 
     let mut buf = MpmcBuf::<u32, 4>::new();
     let chan = <<Spin32Config as TrConfig>::ChanAlloc as Default>::default();
-    let prod =
-        CooperativeRwLockOwned::<(), AtomicUsize, StrictOrderings, Global>::new_owned(());
-    let cons =
-        CooperativeRwLockOwned::<(), AtomicUsize, StrictOrderings, Global>::new_owned(());
-    let (tx, rx) =
-        MpmcChan::<u32, 4, _, Spin32Config>::new_with_locks(&mut buf, chan, prod, cons);
+    let (tx, rx) = MpmcChan::<u32, 4, _, Spin32Config>::new_in(&mut buf, chan);
 
     assert_eq!(tx.try_send(7), Ok(()));
     assert_eq!(rx.try_recv(), Ok(7));
     assert!(block_on(async { tx.send_async(9).await }).is_ok());
-    assert!(matches!(
-        block_on(async { rx.recv_async().await }),
-        Ok(9)
-    ));
+    assert!(matches!(block_on(async { rx.recv_async().await }), Ok(9)));
 
     drop(tx);
     assert!(matches!(
         block_on(async { rx.recv_async().await }),
         Err(RecvError::Closed)
     ));
+}
+
+/// 测试目标：验证多个生产者同时等待时都能被依次唤醒并完成发送。
+/// 手段：容量 2 填满后，两个线程分别对克隆的 `tx` 执行 `send_async(3)` 与
+///       `send_async(4)`；主线程连续接收 4 个值。
+/// 判断：收齐 {1,2,3,4}（不丢不重），两个生产者线程都正常结束。
+/// Test goal: verify multiple waiting producers are all woken and complete.
+/// Method: fill capacity 2, spawn two threads sending 3 and 4 via cloned senders,
+///         then receive four values on the main thread.
+/// Assertion: all of {1,2,3,4} arrive exactly once and both producers finish.
+#[test]
+fn multiple_waiting_producers_all_complete_() {
+    let buf = leak_buf_::<u32, 2>();
+    let (tx, rx) = MpmcChan::new(buf);
+    tx.try_send(1).unwrap();
+    tx.try_send(2).unwrap();
+
+    let tx3 = tx.clone();
+    let p3 = std::thread::spawn(move || {
+        block_on(async { tx3.send_async(3).await }).expect("send_async(3)")
+    });
+    let tx4 = tx.clone();
+    let p4 = std::thread::spawn(move || {
+        block_on(async { tx4.send_async(4).await }).expect("send_async(4)")
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        got.push(block_on(async { rx.recv_async().await }).expect("recv_async"));
+    }
+    p3.join().expect("producer 3 线程不应 panic");
+    p4.join().expect("producer 4 线程不应 panic");
+
+    got.sort_unstable();
+    assert_eq!(got.as_slice(), &[1, 2, 3, 4]);
+}
+
+/// 测试目标：验证关闭会唤醒**所有**同方向等待者，而不是只唤醒队首。
+/// 手段：容量 2 填满后，两个线程分别执行 `send_async(3)` / `send_async(4)`；
+///       主线程 drop `Receiver` 触发关闭，再 join 两个生产者。
+/// 判断：两个生产者都返回 `Err(SendError::Closed(...))`，不会挂起。
+/// Test goal: verify closing wakes every waiter in the same direction.
+/// Method: fill capacity 2, have two threads block on send_async(3)/(4), then drop
+///         the Receiver to close the channel and join both producers.
+/// Assertion: both producers return Err(SendError::Closed(..)) instead of hanging.
+#[test]
+fn close_wakes_all_waiting_producers_() {
+    let buf = leak_buf_::<u32, 2>();
+    let (tx, rx) = MpmcChan::new(buf);
+    tx.try_send(1).unwrap();
+    tx.try_send(2).unwrap();
+
+    let tx3 = tx.clone();
+    let p3 = std::thread::spawn(move || block_on(async { tx3.send_async(3).await }));
+    let tx4 = tx.clone();
+    let p4 = std::thread::spawn(move || block_on(async { tx4.send_async(4).await }));
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    drop(rx);
+
+    let r3 = p3.join().expect("producer 3 线程不应 panic");
+    let r4 = p4.join().expect("producer 4 线程不应 panic");
+    assert_eq!(r3, Err(SendError::Closed(3)));
+    assert_eq!(r4, Err(SendError::Closed(4)));
 }

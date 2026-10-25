@@ -1,18 +1,15 @@
-//! 通道共享内核：两把方向锁、两个单等待者槽、关闭标志与句柄计数。
+//! 通道共享内核：两个方向等待队列、关闭标志与句柄计数。
+//!
+//! 与旧版双锁实现的根本区别：内核里**没有读写锁**。快路径直接操作 Vyukov 环；
+//! 慢路径失败后进入本方向的 [`WaitQueue`]，由队列节点保存 waker 与排队顺序。
+//! 生产者与消费者仍然完全独立：生产队列只在消费者腾出空间时被唤醒，消费队列
+//! 只在生产者发布元素时被唤醒，因此同一方向大量等待不会阻塞对向。
 
 use alloc::{alloc::Global, sync::Arc};
 use core::{
     borrow::BorrowMut,
     marker::PhantomData,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-};
-
-use atomic_sync::{
-    rwlock::cooperative_arena::CooperativeRwLockOwned,
-    x_deps::{
-        abs_sync::async_rwlock::{TrAsyncRwLock, TrAsyncRwLockAcqSess},
-        atomex::StrictOrderings,
-    },
 };
 
 use crate::{MpmcBuf, buf_::Pop_};
@@ -22,70 +19,43 @@ use super::{
     metrics_::metric_,
     receiver_::Receiver,
     sender_::Sender,
-    waker_::WakerSlot,
+    wait_queue_::WaitQueue,
 };
 
 /// 快路径出队结果。
 ///
-/// 不能把「方向锁被占用」与「环空」混成一个 `None`：关闭后仍要 drain 的语义下，
-/// 前者应继续走慢路径，后者才可以返回 `Closed`。
+/// 不能把「环里没有可读元素」与「头槽已预留但生产者尚未发布」混成一个 `None`：
+/// 关闭后仍要 drain 的语义下，后者应继续等待发布，而不是直接返回 `Closed`。
 pub(super) enum TryPop_<T> {
     /// 取到一个元素。
     Value(T),
-    /// 拿到了消费读锁，但环里当前没有可读元素（真空）。
+    /// 确实为空。
     Empty,
-    /// 拿到了消费读锁，头槽已预留但生产者尚未发布；应等待而不是判定关闭。
+    /// 头槽已预留但生产者尚未发布；应等待而不是判定关闭。
     Pending,
-    /// 消费方向锁当前被慢写者/短临界区占用（方案 C），或拥塞位为真（方案 D）；
-    /// 调用方应走慢路径。
-    Busy,
 }
 
-/// 读锁下的入队结果，供 fast / try 两条路径共用并分别计数。
-enum Push_<T> {
-    /// 入队成功。
-    Ok,
-    /// 拿到读锁但环满。
-    Full(T),
-    /// 方向读锁未拿到。
-    Busy(T),
-}
-
-/// 双锁 MPMC 通道的共享内核。
+/// 自建等待队列 MPMC 通道的共享内核。
 ///
-/// 用户通常不直接持有它：[`MpmcChan::new`] 返回一对
-/// [`Sender`] / [`Receiver`] 句柄，句柄内部各持一个 `Arc<MpmcChan>`。
+/// 用户通常不直接持有它：[`MpmcChan::new`] 返回一对 [`Sender`] / [`Receiver`]
+/// 句柄，句柄内部各持一个 `Arc<MpmcChan>`。
 ///
-/// # 锁拓扑
+/// # 等待模型
 ///
-/// - `prod_gate_`：只由生产者获取。默认方案 C 下快路径取读锁；方案 D 下
-///   `send_async` 快路径不取锁、只看拥塞位，`try_send` 仍取读锁。慢路径取写锁并在
-///   满时持锁 park。
-/// - `cons_gate_`：只由消费者获取，结构对称。
-///
-/// 两把锁互不嵌套；发送路径不取消费锁，接收路径不取生产锁。
+/// - `prod_wait_`：生产者慢路径的 FIFO 等待队列。消费者每次成功出队后唤醒队首；
+/// - `cons_wait_`：消费者慢路径的 FIFO 等待队列。生产者每次成功入队后唤醒队首；
+/// - 队列节点由 SlabList 批量分配，包含 waker、状态与双向链接；
+/// - 快路径不检查队列是否非空，始终直接尝试无锁环操作，因此等待队列不会像
+///   读写锁的写者队列那样自我维持；代价是同方向 FIFO 是**近似公平**（快路径
+///   仍可能插队），已在 crate 文档中写明。
 ///
 /// # 调教（`C`）
 ///
-/// 最后一个类型参数 `C: TrConfig` 决定外层 `Arc` 的 allocator
-/// （`C::ChanAlloc`）、生产/消费两把方向锁的具体类型（GAT
-/// `C::ProdGate<'a>` / `C::ConsGate<'a>`）与 async 快路径自旋预算
-/// （`C::FAST_SPIN`），默认为 [`DefaultConfig`]（`CooperativeRwLockOwned` +
-/// 全局分配器 + 512 次自旋）。容量 `N` 与 buffer 载体 `B` 仍是独立参数。
-///
-/// 锁类型由配置指定，因此可以换成其他 [`TrAsyncRwLock`] 实现；替换时必须满足
-/// [`TrConfig::ProdGate`] / [`TrConfig::ConsGate`] 文档中的公平性契约。
-///
-/// # 方案 D（`hybrid` feature）
-///
-/// - `send_async` / `recv_async` 快路径只读拥塞位；失败就置位并进入慢路径；
-/// - 慢路径成功后在释放方向写锁后，用一次 `try_write` 检查「是否还有慢者排队」，
-///   只有队列为空才清拥塞位；
-/// - `try_send` / `try_recv` 仍走方向读锁，因此不会被拥塞位卡死，也不插队到
-///   慢写者队列前面。
-///
-/// 方案 D 的公平性是近似的：快路径在拥塞位被置位前已经在途的 CAS 仍可能插队。
-/// 它适合用基准验证是否值得，不应在未测之前替换默认方案 C。
+/// 最后一个类型参数 `C: TrConfig` 决定外层 `Arc` 与等待节点 SlabList 的
+/// allocator（`C::ChanAlloc`）、两个方向等待队列各自的 SlabList 配置类型
+/// （`C::ProdWaitSlab` / `C::ConsWaitSlab`）与 async 快路径自旋预算
+/// （`C::FAST_SPIN`），默认为 [`DefaultConfig`]。chunk 大小由配置类型携带的
+/// 编译期常量固定。
 ///
 /// # Buffer 所有权
 ///
@@ -95,8 +65,7 @@ enum Push_<T> {
 /// - `&'a mut MpmcBuf`：channel 借用 buffer。
 ///
 /// 两种情况都由 Rust 的所有权/独占借用保证「一个 buffer 只有一个 channel」，
-/// 不需要运行时 claim 标志。不可变 `static BUF: MpmcBuf` 无法安全地产生 `&mut`，
-/// 需要 `static mut` 或 `Box::leak` 一类手段；这是 `BorrowMut` 方案的代价。
+/// 不需要运行时 claim 标志。
 ///
 /// # Examples
 ///
@@ -114,20 +83,12 @@ where
     C: TrConfig + 'a,
 {
     pub(super) buf_: B,
-    pub(super) prod_gate_: C::ProdGate<'a>,
-    pub(super) cons_gate_: C::ConsGate<'a>,
-    pub(super) not_full_: WakerSlot,
-    pub(super) not_empty_: WakerSlot,
+    pub(super) prod_wait_: WaitQueue<C::ProdWaitSlab>,
+    pub(super) cons_wait_: WaitQueue<C::ConsWaitSlab>,
     pub(super) senders_: AtomicUsize,
     pub(super) receivers_: AtomicUsize,
     pub(super) tx_closed_: AtomicBool,
     pub(super) rx_closed_: AtomicBool,
-    /// 方案 D 的生产侧拥塞位；默认方案 C 下不编译。
-    #[cfg(feature = "hybrid")]
-    pub(super) prod_congested_: AtomicBool,
-    /// 方案 D 的消费侧拥塞位。
-    #[cfg(feature = "hybrid")]
-    pub(super) cons_congested_: AtomicBool,
     /// 让 `'a` 在 owned buffer（例如 `Box<MpmcBuf>`）时也有使用点。
     pub(super) _lt_: PhantomData<&'a MpmcBuf<T, N>>,
 }
@@ -142,8 +103,8 @@ where
     /// 构造与 Drop 都会 drain + reset buffer。独占性由所有权/`&mut` 借用保证，
     /// 因此不存在运行时「buffer 已被占用」这一类错误。
     ///
-    /// 要换锁类型、allocator 或自旋预算，使用 [`Self::new_with_locks`] 并显式
-    /// 指定配置类型 `MpmcChan<..., C>`。
+    /// 要换 allocator、等待队列 chunk 大小或自旋预算，使用 [`Self::new_in`] 并
+    /// 显式指定配置类型 `MpmcChan<..., C>`。
     ///
     /// # Examples
     ///
@@ -163,19 +124,7 @@ where
         Sender<'a, T, N, B, DefaultConfig>,
         Receiver<'a, T, N, B, DefaultConfig>,
     ) {
-        let prod = CooperativeRwLockOwned::<
-            (),
-            AtomicUsize,
-            StrictOrderings,
-            Global,
-        >::new_owned(());
-        let cons = CooperativeRwLockOwned::<
-            (),
-            AtomicUsize,
-            StrictOrderings,
-            Global,
-        >::new_owned(());
-        Self::new_with_locks(buf, Global, prod, cons)
+        Self::new_in(buf, Global)
     }
 }
 
@@ -184,59 +133,45 @@ where
     B: BorrowMut<MpmcBuf<T, N>>,
     C: TrConfig + 'a,
 {
-    /// 用 buffer、外层 `Arc` 的 allocator 与两把具体锁实例构造通道。
+    /// 用 buffer 与自定义 allocator 构造通道。
     ///
-    /// 锁类型由 `C::ProdGate<'a>` / `C::ConsGate<'a>` 指定；调用者负责构造实例
-    /// 并保证它们满足 [`TrConfig::ProdGate`] / [`TrConfig::ConsGate`] 的公平性
-    /// 契约。默认配置可以直接用 [`Self::new`]。
+    /// 两个方向的等待队列会各自克隆一份 `chan_alloc` 来分配 SlabList chunk；
+    /// 外层 `Arc` 使用原值。默认配置可以直接用 [`Self::new`]。
+    ///
+    /// # Panics
+    ///
+    /// 当 `C::ProdWaitSlab` / `C::ConsWaitSlab` 的编译期 `CHUNK_SIZE` 无法容纳
+    /// 至少一个等待节点时 panic；这是配置错误，应在配置类型中修正。
     ///
     /// # Examples
     ///
     /// ```
-    /// use mpmc_chan::x_deps::atomic_sync::{
-    ///     rwlock::cooperative_arena::CooperativeRwLockOwned,
-    ///     x_deps::atomex::StrictOrderings,
-    /// };
     /// use mpmc_chan::{DefaultConfig, MpmcBuf, MpmcChan};
-    /// use std::{alloc::Global, sync::atomic::AtomicUsize};
+    /// use std::alloc::Global;
     ///
     /// let mut buf = MpmcBuf::<u8, 2>::new();
-    /// let prod =
-    ///     CooperativeRwLockOwned::<(), AtomicUsize, StrictOrderings, Global>::new_owned(());
-    /// let cons =
-    ///     CooperativeRwLockOwned::<(), AtomicUsize, StrictOrderings, Global>::new_owned(());
-    /// let (tx, rx) = MpmcChan::<u8, 2, _, DefaultConfig>::new_with_locks(
-    ///     &mut buf,
-    ///     Global::default(),
-    ///     prod,
-    ///     cons,
-    /// );
+    /// let (tx, rx) = MpmcChan::<u8, 2, _, DefaultConfig>::new_in(&mut buf, Global);
     /// tx.try_send(1).unwrap();
     /// assert_eq!(rx.try_recv(), Ok(1));
     /// ```
-    pub fn new_with_locks(
+    pub fn new_in(
         mut buf: B,
         chan_alloc: C::ChanAlloc,
-        prod_gate: C::ProdGate<'a>,
-        cons_gate: C::ConsGate<'a>,
     ) -> (Sender<'a, T, N, B, C>, Receiver<'a, T, N, B, C>) {
         buf.borrow_mut().drop_remaining_();
+
+        let prod_wait_ = WaitQueue::<C::ProdWaitSlab>::new_(chan_alloc.clone());
+        let cons_wait_ = WaitQueue::<C::ConsWaitSlab>::new_(chan_alloc.clone());
 
         let core = Arc::new_in(
             MpmcChan {
                 buf_: buf,
-                prod_gate_: prod_gate,
-                cons_gate_: cons_gate,
-                not_full_: WakerSlot::new_(),
-                not_empty_: WakerSlot::new_(),
+                prod_wait_,
+                cons_wait_,
                 senders_: AtomicUsize::new(0),
                 receivers_: AtomicUsize::new(0),
                 tx_closed_: AtomicBool::new(false),
                 rx_closed_: AtomicBool::new(false),
-                #[cfg(feature = "hybrid")]
-                prod_congested_: AtomicBool::new(false),
-                #[cfg(feature = "hybrid")]
-                cons_congested_: AtomicBool::new(false),
                 _lt_: PhantomData,
             },
             chan_alloc,
@@ -265,33 +200,34 @@ where
         self.buf_.borrow().capacity()
     }
 
-    /// 通知两个方向的 park 者。任一方向关闭或状态可能变化时调用。
+    /// 唤醒两个方向全部等待者；关闭或即将关闭时调用。
     #[inline]
-    pub(super) fn notify_both_(&self) {
-        self.not_full_.notify_();
-        self.not_empty_.notify_();
+    pub(super) fn notify_all_(&self) {
+        self.prod_wait_.notify_all_();
+        self.cons_wait_.notify_all_();
     }
 
-    /// 取生产读锁并尝试一次入队；不计数，由 fast / try 调用方分别记账。
+    /// 唤醒生产方向队首：消费者腾出了一个位置。
     #[inline]
-    fn try_push_read_(&self, item: T) -> Push_<T> {
-        let mut sess = self.prod_gate_.acq_session();
-        let Result::Ok(_guard) = sess.try_read() else {
-            return Push_::Busy(item);
-        };
-        match self.buf_.borrow().try_push_(item) {
-            Result::Ok(()) => Push_::Ok,
-            Result::Err(item) => Push_::Full(item),
-        }
+    pub(super) fn notify_prod_(&self) {
+        self.prod_wait_.notify_one_();
     }
 
-    /// 取消费读锁并尝试一次出队；不计数，由 fast / try 调用方分别记账。
+    /// 唤醒消费方向队首：生产者发布了一个元素。
     #[inline]
-    fn try_pop_read_(&self) -> TryPop_<T> {
-        let mut sess = self.cons_gate_.acq_session();
-        let Result::Ok(_guard) = sess.try_read() else {
-            return TryPop_::Busy;
-        };
+    pub(super) fn notify_cons_(&self) {
+        self.cons_wait_.notify_one_();
+    }
+
+    /// 直接尝试一次入队；不计数，由 fast / try 调用方分别记账。
+    #[inline]
+    fn try_push_now_(&self, item: T) -> Result<(), T> {
+        self.buf_.borrow().try_push_(item)
+    }
+
+    /// 直接尝试一次出队，并区分空/未发布；不计数。
+    #[inline]
+    fn try_pop_now_(&self) -> TryPop_<T> {
         match self.buf_.borrow().try_pop_state_() {
             Pop_::Value(value) => TryPop_::Value(value),
             Pop_::Empty => TryPop_::Empty,
@@ -299,36 +235,30 @@ where
         }
     }
 
-    /// `try_send` 使用的非阻塞快路径：取生产读锁，尝试一次入队。
+    /// `try_send` 使用的非阻塞路径：直接尝试一次入队。
     ///
-    /// 这条路径在方案 C / D 下都保留，因为它尊重方向写锁的排队：
-    /// 有慢生产者持有/等待写锁时，`try_send` 返回 would-block，而不是插队。
+    /// 不再有方向锁，因此只有「环满」会失败；慢等待者不会让 `try_send` 变成
+    /// would-block（这是与旧版的语义差异，见 crate 文档的公平性说明）。
     #[inline]
-    pub(super) fn try_push_locked_(&self, item: T) -> Result<(), T> {
+    pub(super) fn try_push_try_(&self, item: T) -> Result<(), T> {
         metric_!(PUSH_TRY_ATTEMPT);
-        match self.try_push_read_(item) {
-            Push_::Ok => {
+        match self.try_push_now_(item) {
+            Result::Ok(()) => {
                 metric_!(PUSH_TRY_OK);
                 Result::Ok(())
             }
-            Push_::Full(item) => {
+            Result::Err(item) => {
                 metric_!(PUSH_TRY_FULL);
-                Result::Err(item)
-            }
-            Push_::Busy(item) => {
-                metric_!(PUSH_TRY_BUSY);
                 Result::Err(item)
             }
         }
     }
 
-    /// `try_recv` 使用的非阻塞快路径：取消费读锁，尝试一次出队。
-    ///
-    /// 返回 [`TryPop_::Busy`] 表示方向锁没拿到，调用方应返回 would-block。
+    /// `try_recv` 使用的非阻塞路径：直接尝试一次出队。
     #[inline]
-    pub(super) fn try_pop_locked_(&self) -> TryPop_<T> {
+    pub(super) fn try_pop_try_(&self) -> TryPop_<T> {
         metric_!(POP_TRY_ATTEMPT);
-        match self.try_pop_read_() {
+        match self.try_pop_now_() {
             TryPop_::Value(value) => {
                 metric_!(POP_TRY_OK);
                 TryPop_::Value(value)
@@ -341,40 +271,30 @@ where
                 metric_!(POP_TRY_PENDING);
                 TryPop_::Pending
             }
-            TryPop_::Busy => {
-                metric_!(POP_TRY_BUSY);
-                TryPop_::Busy
-            }
         }
     }
 
-    /// 方案 C：异步快路径与 `try_*` 一样走读锁。
-    #[cfg(not(feature = "hybrid"))]
+    /// 异步快路径：直接尝试一次入队。
     #[inline]
     pub(super) fn try_push_fast_(&self, item: T) -> Result<(), T> {
         metric_!(PUSH_FAST_ATTEMPT);
-        match self.try_push_read_(item) {
-            Push_::Ok => {
+        match self.try_push_now_(item) {
+            Result::Ok(()) => {
                 metric_!(PUSH_FAST_OK);
                 Result::Ok(())
             }
-            Push_::Full(item) => {
+            Result::Err(item) => {
                 metric_!(PUSH_FAST_FULL);
-                Result::Err(item)
-            }
-            Push_::Busy(item) => {
-                metric_!(PUSH_FAST_BUSY);
                 Result::Err(item)
             }
         }
     }
 
-    /// 方案 C：异步快路径与 `try_*` 一样走读锁。
-    #[cfg(not(feature = "hybrid"))]
+    /// 异步快路径：直接尝试一次出队。
     #[inline]
     pub(super) fn try_pop_fast_(&self) -> TryPop_<T> {
         metric_!(POP_FAST_ATTEMPT);
-        match self.try_pop_read_() {
+        match self.try_pop_now_() {
             TryPop_::Value(value) => {
                 metric_!(POP_FAST_OK);
                 TryPop_::Value(value)
@@ -387,125 +307,6 @@ where
                 metric_!(POP_FAST_PENDING);
                 TryPop_::Pending
             }
-            TryPop_::Busy => {
-                metric_!(POP_FAST_BUSY);
-                TryPop_::Busy
-            }
-        }
-    }
-
-    /// 方案 D：异步生产者快路径不取方向锁，只看拥塞位。
-    ///
-    /// 一旦失败就置拥塞位；后续异步生产者会进入慢路径排队。`try_send` 不走这里，
-    /// 因此不会被这个 hint 永久挡住。
-    #[cfg(feature = "hybrid")]
-    #[inline]
-    pub(super) fn try_push_fast_(&self, item: T) -> Result<(), T> {
-        metric_!(PUSH_FAST_ATTEMPT);
-        if self.prod_congested_.load(Ordering::Acquire) {
-            metric_!(PUSH_FAST_BUSY);
-            return Result::Err(item);
-        }
-        match self.buf_.borrow().try_push_(item) {
-            Result::Ok(()) => {
-                metric_!(PUSH_FAST_OK);
-                Result::Ok(())
-            }
-            Result::Err(item) => {
-                metric_!(PUSH_FAST_FULL);
-                self.set_prod_congested_();
-                Result::Err(item)
-            }
-        }
-    }
-
-    /// 方案 D：异步消费者快路径不取方向锁，只看拥塞位。
-    #[cfg(feature = "hybrid")]
-    #[inline]
-    pub(super) fn try_pop_fast_(&self) -> TryPop_<T> {
-        metric_!(POP_FAST_ATTEMPT);
-        if self.cons_congested_.load(Ordering::Acquire) {
-            metric_!(POP_FAST_BUSY);
-            return TryPop_::Busy;
-        }
-        match self.buf_.borrow().try_pop_state_() {
-            Pop_::Value(value) => {
-                metric_!(POP_FAST_OK);
-                TryPop_::Value(value)
-            }
-            Pop_::Empty => {
-                metric_!(POP_FAST_EMPTY);
-                self.set_cons_congested_();
-                TryPop_::Empty
-            }
-            Pop_::Pending => {
-                metric_!(POP_FAST_PENDING);
-                self.set_cons_congested_();
-                TryPop_::Pending
-            }
-        }
-    }
-
-    /// 方案 D：慢路径开始时置生产拥塞位，挡住后续异步快路径。
-    #[cfg(feature = "hybrid")]
-    #[inline]
-    pub(super) fn set_prod_congested_(&self) {
-        #[cfg(mpmc_metrics)]
-        {
-            if !self.prod_congested_.swap(true, Ordering::Release) {
-                metric_!(CONGESTED_SET_PROD);
-            }
-        }
-        #[cfg(not(mpmc_metrics))]
-        self.prod_congested_.store(true, Ordering::Release);
-    }
-
-    /// 方案 D：慢路径成功后尝试清生产拥塞位。
-    ///
-    /// 只有拿到方向写锁才清：`try_write` 要求队列为空，因此还有慢生产者排队/持锁时
-    /// 会失败，拥塞位保持。这样不会让新快路径插到已排队的慢生产者前面。
-    #[cfg(feature = "hybrid")]
-    #[inline]
-    pub(super) fn clear_prod_congested_(&self) {
-        if !self.prod_congested_.load(Ordering::Acquire) {
-            return;
-        }
-        let mut sess = self.prod_gate_.acq_session();
-        if let Result::Ok(_guard) = sess.try_write() {
-            self.prod_congested_.store(false, Ordering::Release);
-            metric_!(CONGESTED_CLEAR_PROD);
-        } else {
-            metric_!(CONGESTED_CLEAR_FAIL_PROD);
-        }
-    }
-
-    /// 方案 D：慢路径开始时置消费拥塞位。
-    #[cfg(feature = "hybrid")]
-    #[inline]
-    pub(super) fn set_cons_congested_(&self) {
-        #[cfg(mpmc_metrics)]
-        {
-            if !self.cons_congested_.swap(true, Ordering::Release) {
-                metric_!(CONGESTED_SET_CONS);
-            }
-        }
-        #[cfg(not(mpmc_metrics))]
-        self.cons_congested_.store(true, Ordering::Release);
-    }
-
-    /// 方案 D：慢路径成功后尝试清消费拥塞位。
-    #[cfg(feature = "hybrid")]
-    #[inline]
-    pub(super) fn clear_cons_congested_(&self) {
-        if !self.cons_congested_.load(Ordering::Acquire) {
-            return;
-        }
-        let mut sess = self.cons_gate_.acq_session();
-        if let Result::Ok(_guard) = sess.try_write() {
-            self.cons_congested_.store(false, Ordering::Release);
-            metric_!(CONGESTED_CLEAR_CONS);
-        } else {
-            metric_!(CONGESTED_CLEAR_FAIL_CONS);
         }
     }
 }

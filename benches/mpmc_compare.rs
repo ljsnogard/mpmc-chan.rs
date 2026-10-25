@@ -1,12 +1,12 @@
-//! MPMC 通道性能对比：mpmc-chan C / D、flume、crossbeam-channel、crossbeam-queue。
+//! MPMC 通道性能对比：mpmc-chan、flume、crossbeam-channel、crossbeam-queue。
 //!
 //! # 场景
 //!
-//! - `async`：生产者/消费者线程各自 `block_on` 一次异步 send/recv；mpmc 的 C/D 与
+//! - `async`：生产者/消费者线程各自 `block_on` 一次异步 send/recv；mpmc 与
 //!   flume async 可比。crossbeam-channel 是阻塞 API，单独标成 `blocking`；
 //!   crossbeam-queue 是无等待的 spin 基线，标成 `spin`。
 //! - `try`：所有实现用非阻塞 try_send/try_recv（或 ArrayQueue push/pop）在 spin
-//!   循环里跑。mpmc 的 D 在 `try_*` 上故意仍走读锁，因此这一组预计 C≈D。
+//!   循环里跑；mpmc 的 `try_*` 与 async 快路径一样直接无锁尝试。
 //!
 //! # 输出
 //!
@@ -22,7 +22,6 @@
 //!
 //! ```sh
 //! taskset -c 0-3 cargo bench --offline --bench mpmc_compare
-//! taskset -c 0-3 cargo bench --offline --features hybrid --bench mpmc_compare
 //! # 只统计快/慢路径比例（计数会扭曲时间，不能用来测吞吐）：
 //! RUSTFLAGS="--cfg mpmc_metrics" taskset -c 0-3 cargo bench --offline --bench mpmc_compare
 //! ```
@@ -56,13 +55,9 @@ use flume as fl;
 use futures_lite::future::block_on;
 use mpmc_chan::{MpmcBuf, MpmcChan, RecvError, TryRecvError, TrySendError};
 
-/// 本次编译对应的 mpmc-chan 方案标签。
+/// 本次编译对应的 mpmc-chan 实现标签。
 fn mpmc_label_() -> &'static str {
-    if cfg!(feature = "hybrid") {
-        "mpmc-D"
-    } else {
-        "mpmc-C"
-    }
+    "mpmc"
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

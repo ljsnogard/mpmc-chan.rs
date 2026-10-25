@@ -1,7 +1,7 @@
-//! 双锁 MPMC 通道的内部模块与公开导出。
+//! 自建等待队列 MPMC 通道的内部模块与公开导出。
 //!
 //! 导出列表逐项列出，不使用 `*` 自动匹配；实际逻辑分散在 `core_` /
-//! `sender_` / `receiver_` / `waker_` / `util_` / `error_` 中。
+//! `sender_` / `receiver_` / `wait_queue_` / `config_` / `util_` / `error_` 中。
 
 mod config_;
 mod core_;
@@ -10,9 +10,12 @@ mod metrics_;
 mod receiver_;
 mod sender_;
 mod util_;
-mod waker_;
+mod wait_queue_;
 
-pub use config_::{DefaultConfig, TrConfig};
+pub use config_::{
+    DEFAULT_CHUNK_BYTES, DefaultConfig, MAX_SLOTS_PER_CHUNK, SlabListConfig, TrConfig,
+    TrSlabConfig, WaitSlab4K, WaitSlab16K, WaitSlab64K,
+};
 pub use core_::MpmcChan;
 pub use error_::{RecvError, SendError, TryRecvError, TrySendError};
 pub use receiver_::Receiver;

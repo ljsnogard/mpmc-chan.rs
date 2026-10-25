@@ -6,5 +6,4 @@
 ///
 /// 自旋是同步段，没有 `.await`；取消/关闭不能只靠下一次 await 观察。每 16 次
 /// 检查一次，既控制延迟又避免把原子 load 放进最内层循环。
-#[cfg(not(feature = "hybrid"))]
 pub(super) const CANCEL_CHECK_EVERY: usize = 16;

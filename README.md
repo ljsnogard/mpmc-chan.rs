@@ -4,20 +4,31 @@ An array-based, async-runtime-agnostic, `no_std` MPMC channel with back pressure
 
 ## Design
 
-- **Fast path (default, plan C)**: each direction first takes a *read* lock on its
-  own `CooperativeRwLock`, then competes for a slot in a Vyukov bounded sequence
-  ring. If that attempt fails, `send_async`/`recv_async` retry the fast path for a
-  bounded number of spins before entering the slow path (configurable via
-  `TrConfig::FAST_SPIN`, default 512). With the `hybrid` feature (plan D),
-  `send_async`/`recv_async` skip the read lock and use a per-direction congestion
-  hint; `try_send`/`try_recv` keep the read-lock path and never spin.
-- **Slow path**: if the ring is full/empty (or the direction lock is busy), the
-  operation releases the read lock, queues as a **writer** on the same direction
-  lock, and — once admitted — parks while **holding** that direction write lock.
-  Producers and consumers use independent locks, so a parked producer never blocks
-  a consumer (and vice versa).
-- Only one waiter per direction can be parked, so each direction needs just one
-  single-waiter notification slot. Same-direction waiters are FIFO.
+- **Fast path (no locks)**: `try_send`/`try_recv` and the first attempt of
+  `send_async`/`recv_async` go straight to a Vyukov bounded sequence ring with a
+  CAS. No read lock, no writer-queued hint, and no per-operation lock RMW.
+- **Bounded spin**: after the first async fast-path failure, `send_async`/
+  `recv_async` retry the lock-free fast path for `TrConfig::FAST_SPIN` iterations
+  (default 512) before entering the wait queue. Cancellation/close are checked
+  every 16 iterations so a cancelled future stays observable.
+- **Per-direction async wait queue**: each direction owns an independent FIFO
+  queue of wait nodes. A node stores the `Waker`, a state, and intrusive links.
+  Nodes are allocated from a **SlabList** (chunked slab): after the first chunk,
+  park/wake/cancel do no per-node heap allocation. `notify_one` pops the queue
+  head and calls `wake` outside the queue spin lock; `notify_all` is used on close.
+- **No rwlock**: the slow path no longer queues as a writer and never parks while
+  holding a direction lock. A producer waiter is woken only when a consumer frees
+  a slot; a consumer waiter is woken only when a producer publishes an item. A
+  backlog in one direction therefore cannot block the other.
+- **Fairness is approximate**: the fast path never yields to queued waiters, so a
+  successful CAS can overtake a parked one. Same-direction waiters are woken in
+  FIFO order, but strict writer-priority/barging-free semantics are not promised.
+  This is intentional: the old write-lock queue became self-sustaining under
+  contention (queued writers blocked every fast path, so almost every operation
+  fell back to the slow path). Removing that gate is the main source of the
+  performance gain; see `dev-notes/mpmc-waitqueue-20261026-0245.md`.
+- **Cancel safety**: `WaitGuard` owns the queue node and releases it from `Drop`,
+  so dropping a cancelled future cannot leak a node or a waker.
 - The buffer is passed through `BorrowMut<MpmcBuf>`: the channel can own it
   (`MpmcBuf`, `Box<MpmcBuf>`) or borrow it as `&mut MpmcBuf`. Ownership/the `&mut`
   borrow guarantees that one buffer serves only one live channel; there is no
@@ -36,28 +47,19 @@ assert_eq!(rx.try_recv(), Ok(1));
 // Async: `.await` or `.may_cancel_with(token)`.
 // let value = rx.recv_async().await?;
 
-// Custom tuning (feat/rwlock-config): `TrConfig` selects the outer Arc
-// allocator and the two lock types via GATs. `new_with_locks` takes the
-// lock instances; the lock impl must satisfy the fairness contract documented
-// on `TrConfig::ProdGate` / `TrConfig::ConsGate`.
-// use mpmc_chan::x_deps::atomic_sync::{
-//     rwlock::cooperative_arena::CooperativeRwLockOwned,
-//     x_deps::atomex::StrictOrderings,
-// };
-// use mpmc_chan::{DefaultConfig, TrConfig};
-// use std::{alloc::Global, sync::atomic::AtomicUsize};
-// struct FastSpin;
-// impl TrConfig for FastSpin {
+// Custom tuning: `TrConfig` selects the outer Arc/SlabList allocator, the
+// per-direction type-level SlabList chunk configuration and the spin budget.
+// Use `new_in` with a custom config type and allocator instance.
+// use mpmc_chan::{DefaultConfig, TrConfig, WaitSlab4K};
+// use std::alloc::Global;
+// struct SmallConfig;
+// impl TrConfig for SmallConfig {
 //     type ChanAlloc = <DefaultConfig as TrConfig>::ChanAlloc;
-//     type ProdGate<'a> = <DefaultConfig as TrConfig>::ProdGate<'a> where Self: 'a;
-//     type ConsGate<'a> = <DefaultConfig as TrConfig>::ConsGate<'a> where Self: 'a;
+//     type ProdWaitSlab = WaitSlab4K<Global>;
+//     type ConsWaitSlab = WaitSlab4K<Global>;
 //     const FAST_SPIN: usize = 32;
 // }
-// let prod = CooperativeRwLockOwned::<(), AtomicUsize, StrictOrderings, Global>::new_owned(());
-// let cons = CooperativeRwLockOwned::<(), AtomicUsize, StrictOrderings, Global>::new_owned(());
-// let (tx, rx) = MpmcChan::<u32, 8, _, FastSpin>::new_with_locks(
-//     &mut buf, Global, prod, cons,
-// );
+// let (tx, rx) = MpmcChan::<u32, 8, _, SmallConfig>::new_in(&mut buf, Global);
 
 // A `'static` buffer needs a mutable place; an immutable
 // `static BUF: MpmcBuf<...>` cannot produce `&mut`. For example:
@@ -70,51 +72,52 @@ capacity 1 correctly). A borrowed buffer must outlive all senders/receivers/futu
 
 ## Status
 
-- Plan C (read lock every fast-path operation + dual direction locks) is the
-  default and is implemented/tested.
-- Plan D (congestion hint for `send_async`/`recv_async`; `try_*` remain locked)
-  is implemented behind `--features hybrid` and passes the same tests.
-- A comparison harness (`benches/mpmc_compare.rs`) covers C, D, flume,
-  crossbeam-channel and crossbeam-queue for async and try/spin workloads; see
-  the provisional results and caveats in
-  `dev-notes/mpmc-design-20261025-1535.md` §8.5.
-- The async slow path, not the ring CAS, dominated under sustained full/empty.
-  A bounded fast-path spin now brings plan C at 4P4C/cap64 from ~10.2 us/item to
-  0.47-0.79 us/item (5-round medians across runs); plan D still suffers from a
-  sticky congestion hint and is not a clear win, so C remains the default.
-- On `feat/rwlock-config`, `TrConfig` exposes the two lock types as GATs
-  (`ProdGate<'a>`/`ConsGate<'a>`) plus the outer `Arc` allocator and spin budget;
-  custom locks are injected via `new_with_locks`. The default `new` path still
-  uses `CooperativeRwLockOwned` and the fairness contract is documented on the
-  GATs.
+- The lock-free fast path plus per-direction SlabList-backed wait queues is the
+  only implementation; the old `CooperativeRwLock`/`hybrid` variants and their
+  configuration GATs were removed.
+- Tests: 40 unit tests + 15 doc tests, including multi-waiter FIFO,
+  close-wakes-all, cancellation/reclaim and cross-chunk SlabList cases.
+- Comparison on the same machine (`BENCH_OPS=20000`, 5 rounds, medians, ns/item):
+
+  | scenario | previous P1 (rwlock) | SlabList wait queue |
+  | --- | ---: | ---: |
+  | 1P1C cap64 async | 290.6 | 134.7 |
+  | 1P1C cap64 try | 339.8 | 82.4 |
+  | 2P2C cap64 async | 325.2 | 250.6 |
+  | 2P2C cap64 try | 378.5 | 235.6 |
+  | 2P2C cap1024 async | 317.5 | 253.2 |
+  | 2P2C cap1024 try | 380.7 | 222.3 |
+  | 4P4C cap64 async | 457.1 | 313.4 |
+  | 4P4C cap64 try | 727.9 | 396.7 |
+
+  Raw CSVs and the causal discussion are in
+  `dev-notes/mpmc-waitqueue-20261026-0245.md`.
 
 ```sh
 cargo test
-cargo test --features hybrid
+cargo clippy --all-targets
 ```
 
 ## Benchmarks
 
 ```sh
-# C (default)
+# default build
 taskset -c 0-3 cargo bench --offline --bench mpmc_compare
-
-# D (hybrid feature)
-taskset -c 0-3 cargo bench --offline --features hybrid --bench mpmc_compare
 ```
 
 Tune with `BENCH_OPS` (per producer, default 20000), `BENCH_ROUNDS` (5),
 `BENCH_PRODUCERS` / `BENCH_CONSUMERS` (4/4), `BENCH_CAP` (64; mpmc-chan accepts
-8/64/1024) and `BENCH_WARMUP` (1). The harness prints per-round CSV and a
-median summary; it is not an apples-to-apples microbenchmark because async
-channels are driven by `futures_lite::block_on`, crossbeam-channel uses OS
-blocking, and crossbeam-queue uses spin.
+8/64/1024) and `BENCH_WARMUP` (1). `BENCH_IMPLS=mpmc|ext|all` filters the
+implementations. The harness prints per-round CSV and a median summary; it is not
+an apples-to-apples microbenchmark because async channels are driven by
+`futures_lite::block_on`, crossbeam-channel uses OS blocking, and crossbeam-queue
+uses spin.
 
 ## Platform
 
-- `#![no_std]`, but uses `alloc`: `atomic_sync`'s `CooperativeRwLock` allocates an
-  `Arc` core and arena chunks for its wait queues.
-- Nightly toolchain (`gen_mcf2` / `atomic_sync` require nightly features).
+- `#![no_std]`, but uses `alloc`: the channel's `Arc` core and the SlabList chunks
+  for wait nodes are heap allocated. The ring buffer itself does not allocate.
+- Nightly toolchain (`gen_mcf2` requires nightly features).
 - Dependencies point at the Gitee default branches. Before release, pin `rev`
   (or commit `Cargo.lock`); the local dev machine may need cached git checkouts
   when building offline.
