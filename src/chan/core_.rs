@@ -7,12 +7,19 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use atomic_sync::rwlock::cooperative_arena::CooperativeRwLockOwned;
+use atomic_sync::{
+    rwlock::cooperative_arena::CooperativeRwLockOwned,
+    x_deps::atomex::StrictOrderings,
+};
 
 use crate::{MpmcBuf, buf_::Pop_};
 
 use super::{
-    metrics_::metric_, receiver_::Receiver, sender_::Sender, waker_::WakerSlot,
+    config_::{DefaultConfig, TrConfig},
+    metrics_::metric_,
+    receiver_::Receiver,
+    sender_::Sender,
+    waker_::WakerSlot,
 };
 
 /// 快路径出队结果。
@@ -55,6 +62,13 @@ enum Push_<T> {
 ///
 /// 两把锁互不嵌套；发送路径不取消费锁，接收路径不取生产锁。
 ///
+/// # 调教（`C`）
+///
+/// 最后一个类型参数 `C: TrConfig` 决定两把方向锁等待队列的 allocator
+/// （`C::Alloc`）与 async 快路径自旋预算（`C::FAST_SPIN`），默认为
+/// [`DefaultConfig`]（全局分配器 + 512 次自旋）。容量 `N` 与 buffer 载体 `B`
+/// 仍是独立参数。
+///
 /// # 方案 D（`hybrid` feature）
 ///
 /// - `send_async` / `recv_async` 快路径只读拥塞位；失败就置位并进入慢路径；
@@ -87,13 +101,14 @@ enum Push_<T> {
 /// tx.try_send(1).unwrap();
 /// assert_eq!(rx.try_recv(), Ok(1));
 /// ```
-pub struct MpmcChan<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>>
+pub struct MpmcChan<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>, C = DefaultConfig>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
+    C: TrConfig,
 {
     pub(super) buf_: B,
-    pub(super) prod_gate_: CooperativeRwLockOwned<()>,
-    pub(super) cons_gate_: CooperativeRwLockOwned<()>,
+    pub(super) prod_gate_: CooperativeRwLockOwned<(), AtomicUsize, StrictOrderings, C::Alloc>,
+    pub(super) cons_gate_: CooperativeRwLockOwned<(), AtomicUsize, StrictOrderings, C::Alloc>,
     pub(super) not_full_: WakerSlot,
     pub(super) not_empty_: WakerSlot,
     pub(super) senders_: AtomicUsize,
@@ -110,15 +125,18 @@ where
     pub(super) _lt_: PhantomData<&'a MpmcBuf<T, N>>,
 }
 
-impl<'a, T, const N: usize, B> MpmcChan<'a, T, N, B>
+impl<'a, T, const N: usize, B> MpmcChan<'a, T, N, B, DefaultConfig>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
 {
-    /// 用 buffer 构造一对通道句柄。
+    /// 用 buffer 构造一对通道句柄（默认 [`DefaultConfig`]）。
     ///
     /// `buf` 可以是 owned `MpmcBuf`、`Box<MpmcBuf>`，也可以是 `&mut MpmcBuf`。
     /// 构造与 Drop 都会 drain + reset buffer。独占性由所有权/`&mut` 借用保证，
     /// 因此不存在运行时「buffer 已被占用」这一类错误。
+    ///
+    /// 要换 allocator 或自旋预算，使用 [`Self::new_in`] 并显式指定配置类型
+    /// `MpmcChan<..., C>`。
     ///
     /// # Examples
     ///
@@ -132,13 +150,60 @@ where
     /// ```
     // 该构造器按设计返回一对句柄，而不是 `Self`；`new` 这个名字对使用方最直观。
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(mut buf: B) -> (Sender<'a, T, N, B>, Receiver<'a, T, N, B>) {
+    pub fn new(
+        buf: B,
+    ) -> (
+        Sender<'a, T, N, B, DefaultConfig>,
+        Receiver<'a, T, N, B, DefaultConfig>,
+    ) {
+        Self::new_in(
+            buf,
+            <<DefaultConfig as TrConfig>::Alloc as Default>::default(),
+        )
+    }
+}
+
+impl<'a, T, const N: usize, B, C> MpmcChan<'a, T, N, B, C>
+where
+    B: BorrowMut<MpmcBuf<T, N>>,
+    C: TrConfig,
+{
+    /// 用 buffer 与显式 allocator 构造一对通道句柄。
+    ///
+    /// 两把方向锁各拿一份 `alloc.clone()`；`MpmcChan` 外层 `Arc` 仍使用全局
+    /// 分配器。带状态（非 `Default`）的 allocator 用这个入口。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mpmc_chan::{DefaultConfig, MpmcBuf, MpmcChan, TrConfig};
+    ///
+    /// let mut buf = MpmcBuf::<u8, 2>::new();
+    /// let alloc = <<DefaultConfig as TrConfig>::Alloc as Default>::default();
+    /// let (tx, rx) = MpmcChan::<u8, 2, _, DefaultConfig>::new_in(&mut buf, alloc);
+    /// tx.try_send(1).unwrap();
+    /// assert_eq!(rx.try_recv(), Ok(1));
+    /// ```
+    pub fn new_in(
+        mut buf: B,
+        alloc: C::Alloc,
+    ) -> (Sender<'a, T, N, B, C>, Receiver<'a, T, N, B, C>) {
         buf.borrow_mut().drop_remaining_();
 
         let core = Arc::new(MpmcChan {
             buf_: buf,
-            prod_gate_: CooperativeRwLockOwned::<()>::new_owned(()),
-            cons_gate_: CooperativeRwLockOwned::<()>::new_owned(()),
+            prod_gate_: CooperativeRwLockOwned::<
+                (),
+                AtomicUsize,
+                StrictOrderings,
+                C::Alloc,
+            >::new_owned_in((), alloc.clone()),
+            cons_gate_: CooperativeRwLockOwned::<
+                (),
+                AtomicUsize,
+                StrictOrderings,
+                C::Alloc,
+            >::new_owned_in((), alloc),
             not_full_: WakerSlot::new_(),
             not_empty_: WakerSlot::new_(),
             senders_: AtomicUsize::new(0),
@@ -420,9 +485,10 @@ where
     }
 }
 
-impl<T, const N: usize, B> Drop for MpmcChan<'_, T, N, B>
+impl<T, const N: usize, B, C> Drop for MpmcChan<'_, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
+    C: TrConfig,
 {
     fn drop(&mut self) {
         // 走到这里说明所有 Sender/Receiver/Future 都已经消失，不可能有在途操作。

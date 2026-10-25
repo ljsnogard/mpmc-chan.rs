@@ -324,6 +324,7 @@ fn handles_are_send_sync_() {
             'static,
             u32,
             MpmcBuf<u32, 4>,
+            crate::DefaultConfig,
             4,
             abs_cancel::NonCancellableToken,
         >,
@@ -335,6 +336,7 @@ fn handles_are_send_sync_() {
             'static,
             u32,
             MpmcBuf<u32, 4>,
+            crate::DefaultConfig,
             4,
             abs_cancel::NonCancellableToken,
         >,
@@ -356,4 +358,43 @@ fn async_recv_closed_() {
         block_on(async { rx.recv_async().await }),
         Err(RecvError::Closed)
     );
+}
+
+/// 测试目标：验证自定义 `TrConfig` 的 allocator 与自旋预算可被通道采用。
+/// 手段：定义 `Spin32Config`（复用默认 allocator，`FAST_SPIN = 32`），用
+///       `new_in` 构造容量 4 的通道，跑一次 try 往返与两次 async 往返。
+/// 判断：`FAST_SPIN == 32`；try/async 发送接收值正确；关闭后 recv 返回 `Closed`。
+/// Test goal: verify a custom TrConfig supplies the allocator and spin budget.
+/// Method: define Spin32Config (default allocator, FAST_SPIN = 32), build a
+///         capacity-4 channel via new_in, run try and async roundtrips.
+/// Assertion: FAST_SPIN == 32; values match; closed recv returns Closed.
+#[test]
+fn custom_config_() {
+    use crate::{DefaultConfig, TrConfig};
+
+    struct Spin32Config;
+    impl TrConfig for Spin32Config {
+        type Alloc = <DefaultConfig as TrConfig>::Alloc;
+        const FAST_SPIN: usize = 32;
+    }
+
+    assert_eq!(Spin32Config::FAST_SPIN, 32);
+
+    let mut buf = MpmcBuf::<u32, 4>::new();
+    let alloc = <<Spin32Config as TrConfig>::Alloc as Default>::default();
+    let (tx, rx) = MpmcChan::<u32, 4, _, Spin32Config>::new_in(&mut buf, alloc);
+
+    assert_eq!(tx.try_send(7), Ok(()));
+    assert_eq!(rx.try_recv(), Ok(7));
+    assert!(block_on(async { tx.send_async(9).await }).is_ok());
+    assert!(matches!(
+        block_on(async { rx.recv_async().await }),
+        Ok(9)
+    ));
+
+    drop(tx);
+    assert!(matches!(
+        block_on(async { rx.recv_async().await }),
+        Err(RecvError::Closed)
+    ));
 }

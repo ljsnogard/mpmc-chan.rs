@@ -5,7 +5,7 @@ use core::{borrow::BorrowMut, sync::atomic::Ordering, task::Poll};
 
 
 #[cfg(not(feature = "hybrid"))]
-use super::util_::{CANCEL_CHECK_EVERY, FAST_SPIN_BUDGET};
+use super::util_::CANCEL_CHECK_EVERY;
 
 use abs_cancel::TrCancellationToken;
 use gen_mcf2::gen_may_cancel_future;
@@ -13,6 +13,7 @@ use gen_mcf2::gen_may_cancel_future;
 use crate::MpmcBuf;
 
 use super::{
+    config_::{DefaultConfig, TrConfig},
     core_::MpmcChan,
     error_::{SendError, TrySendError},
     metrics_::metric_,
@@ -34,19 +35,21 @@ use super::{
 /// tx.try_send(1).unwrap();
 /// assert_eq!(rx.try_recv(), Ok(1));
 /// ```
-pub struct Sender<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>>
+pub struct Sender<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>, C = DefaultConfig>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
+    C: TrConfig,
 {
-    core_: Arc<MpmcChan<'a, T, N, B>>,
+    core_: Arc<MpmcChan<'a, T, N, B, C>>,
 }
 
-impl<'a, T, const N: usize, B> Sender<'a, T, N, B>
+impl<'a, T, const N: usize, B, C> Sender<'a, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
+    C: TrConfig,
 {
     /// 内部构造：增加发送端句柄计数。
-    pub(super) fn new_(core_: Arc<MpmcChan<'a, T, N, B>>) -> Self {
+    pub(super) fn new_(core_: Arc<MpmcChan<'a, T, N, B, C>>) -> Self {
         core_.senders_.fetch_add(1, Ordering::Relaxed);
         Sender { core_ }
     }
@@ -113,7 +116,7 @@ where
     /// assert_eq!(block_on(async { tx.send_async(7).await }), Ok(()));
     /// assert_eq!(rx.try_recv(), Ok(7));
     /// ```
-    pub fn send_async<'f>(&'f self, item: T) -> SendAsync<'a, 'f, 'f, T, B, N>
+    pub fn send_async<'f>(&'f self, item: T) -> SendAsync<'a, 'f, 'f, T, B, C, N>
     where
         'a: 'f,
     {
@@ -147,9 +150,10 @@ where
     }
 }
 
-impl<T, const N: usize, B> Clone for Sender<'_, T, N, B>
+impl<T, const N: usize, B, C> Clone for Sender<'_, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
+    C: TrConfig,
 {
     fn clone(&self) -> Self {
         self.core_.senders_.fetch_add(1, Ordering::Relaxed);
@@ -159,9 +163,10 @@ where
     }
 }
 
-impl<T, const N: usize, B> Drop for Sender<'_, T, N, B>
+impl<T, const N: usize, B, C> Drop for Sender<'_, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
+    C: TrConfig,
 {
     fn drop(&mut self) {
         let old = self.core_.senders_.fetch_sub(1, Ordering::AcqRel);
@@ -175,14 +180,15 @@ where
 
 /// 异步发送流程；由 `gen_mcf2` 生成 `SendAsync` / `SendFuture` 两件套。
 #[gen_may_cancel_future(Send, pub, new(pub(crate)))]
-async fn send_async_<'a, 'f, T, B, const N: usize, C>(
-    sender: &'f Sender<'a, T, N, B>,
+async fn send_async_<'a, 'f, T, B, const N: usize, Cfg, C>(
+    sender: &'f Sender<'a, T, N, B, Cfg>,
     item: T,
     cancel: C,
 ) -> Result<(), SendError<T>>
 where
     'a: 'f,
     B: BorrowMut<MpmcBuf<T, N>>,
+    Cfg: TrConfig,
     C: TrCancellationToken,
 {
     if cancel.is_cancelled() {
@@ -212,7 +218,7 @@ where
     #[cfg(not(feature = "hybrid"))]
     {
         metric_!(SPIN_PUSH_ENTER);
-        for spin in 0..FAST_SPIN_BUDGET {
+        for spin in 0..Cfg::FAST_SPIN {
             if spin % CANCEL_CHECK_EVERY == 0 {
                 if cancel.is_cancelled() {
                     metric_!(PUSH_SLOW_CANCEL);

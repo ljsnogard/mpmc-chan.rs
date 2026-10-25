@@ -5,7 +5,7 @@ use core::{borrow::BorrowMut, sync::atomic::Ordering, task::Poll};
 
 
 #[cfg(not(feature = "hybrid"))]
-use super::util_::{CANCEL_CHECK_EVERY, FAST_SPIN_BUDGET};
+use super::util_::CANCEL_CHECK_EVERY;
 
 use abs_cancel::TrCancellationToken;
 use gen_mcf2::gen_may_cancel_future;
@@ -13,6 +13,7 @@ use gen_mcf2::gen_may_cancel_future;
 use crate::{MpmcBuf, buf_::Pop_};
 
 use super::{
+    config_::{DefaultConfig, TrConfig},
     core_::{MpmcChan, TryPop_},
     error_::{RecvError, TryRecvError},
     metrics_::metric_,
@@ -34,19 +35,21 @@ use super::{
 /// tx.try_send(1).unwrap();
 /// assert_eq!(rx.try_recv(), Ok(1));
 /// ```
-pub struct Receiver<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>>
+pub struct Receiver<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>, C = DefaultConfig>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
+    C: TrConfig,
 {
-    core_: Arc<MpmcChan<'a, T, N, B>>,
+    core_: Arc<MpmcChan<'a, T, N, B, C>>,
 }
 
-impl<'a, T, const N: usize, B> Receiver<'a, T, N, B>
+impl<'a, T, const N: usize, B, C> Receiver<'a, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
+    C: TrConfig,
 {
     /// 内部构造：增加接收端句柄计数。
-    pub(super) fn new_(core_: Arc<MpmcChan<'a, T, N, B>>) -> Self {
+    pub(super) fn new_(core_: Arc<MpmcChan<'a, T, N, B, C>>) -> Self {
         core_.receivers_.fetch_add(1, Ordering::Relaxed);
         Receiver { core_ }
     }
@@ -113,7 +116,7 @@ where
     /// tx.try_send(7).unwrap();
     /// assert_eq!(block_on(async { rx.recv_async().await }), Ok(7));
     /// ```
-    pub fn recv_async<'f>(&'f self) -> RecvAsync<'a, 'f, 'f, T, B, N>
+    pub fn recv_async<'f>(&'f self) -> RecvAsync<'a, 'f, 'f, T, B, C, N>
     where
         'a: 'f,
     {
@@ -147,9 +150,10 @@ where
     }
 }
 
-impl<T, const N: usize, B> Clone for Receiver<'_, T, N, B>
+impl<T, const N: usize, B, C> Clone for Receiver<'_, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
+    C: TrConfig,
 {
     fn clone(&self) -> Self {
         self.core_.receivers_.fetch_add(1, Ordering::Relaxed);
@@ -159,9 +163,10 @@ where
     }
 }
 
-impl<T, const N: usize, B> Drop for Receiver<'_, T, N, B>
+impl<T, const N: usize, B, C> Drop for Receiver<'_, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
+    C: TrConfig,
 {
     fn drop(&mut self) {
         let old = self.core_.receivers_.fetch_sub(1, Ordering::AcqRel);
@@ -175,13 +180,14 @@ where
 
 /// 异步接收流程；由 `gen_mcf2` 生成 `RecvAsync` / `RecvFuture` 两件套。
 #[gen_may_cancel_future(Recv, pub, new(pub(crate)))]
-async fn recv_async_<'a, 'f, T, B, const N: usize, C>(
-    receiver: &'f Receiver<'a, T, N, B>,
+async fn recv_async_<'a, 'f, T, B, const N: usize, Cfg, C>(
+    receiver: &'f Receiver<'a, T, N, B, Cfg>,
     cancel: C,
 ) -> Result<T, RecvError>
 where
     'a: 'f,
     B: BorrowMut<MpmcBuf<T, N>>,
+    Cfg: TrConfig,
     C: TrCancellationToken,
 {
     if cancel.is_cancelled() {
@@ -213,7 +219,7 @@ where
     #[cfg(not(feature = "hybrid"))]
     {
         metric_!(SPIN_POP_ENTER);
-        for spin in 0..FAST_SPIN_BUDGET {
+        for spin in 0..Cfg::FAST_SPIN {
             if spin % CANCEL_CHECK_EVERY == 0 && cancel.is_cancelled() {
                 metric_!(POP_SLOW_CANCEL);
                 return Result::Err(RecvError::Cancelled);

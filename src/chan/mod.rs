@@ -3,6 +3,7 @@
 //! 导出列表逐项列出，不使用 `*` 自动匹配；实际逻辑分散在 `core_` /
 //! `sender_` / `receiver_` / `waker_` / `util_` / `error_` 中。
 
+mod config_;
 mod core_;
 mod error_;
 mod metrics_;
@@ -11,6 +12,7 @@ mod sender_;
 mod util_;
 mod waker_;
 
+pub use config_::{DefaultConfig, TrConfig};
 pub use core_::MpmcChan;
 pub use error_::{RecvError, SendError, TryRecvError, TrySendError};
 pub use receiver_::Receiver;

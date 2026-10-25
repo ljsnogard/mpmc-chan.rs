@@ -17,6 +17,13 @@
 //! 借用保证，不需要运行时 claim。不可变 `static BUF` 不能安全产生 `&mut`，需要
 //! `static mut` / `Box::leak` 一类手段。
 //!
+//! # 调教
+//!
+//! 两把方向锁的 allocator 与 async 快路径自旋预算由 [`TrConfig`] 决定，默认
+//! [`DefaultConfig`] = 全局分配器 + 512 次自旋。`MpmcChan` 的最后一个类型参数
+//! 是配置类型；自定义配置用 `MpmcChan::<..., C>::new_in(buf, alloc)` 构造。
+//! 容量 `N` 与 buffer 载体 `B` 仍是独立参数。
+//!
 //! # 示例
 //!
 //! ```
@@ -35,7 +42,7 @@
 //! park 者时会申请 Arena chunk，之后稳态不再分配。
 
 #![no_std]
-#![feature(impl_trait_in_assoc_type)]
+#![feature(allocator_ext, impl_trait_in_assoc_type)]
 
 extern crate alloc;
 
@@ -56,8 +63,8 @@ pub mod bench_metrics;
 
 pub use buf_::MpmcBuf;
 pub use chan::{
-    MpmcChan, Receiver, RecvAsync, RecvError, RecvFuture, SendAsync, SendError, SendFuture, Sender,
-    TryRecvError, TrySendError,
+    DefaultConfig, MpmcChan, Receiver, RecvAsync, RecvError, RecvFuture, SendAsync, SendError,
+    SendFuture, Sender, TrConfig, TryRecvError, TrySendError,
 };
 
 /// 本 crate 依赖的外部 crate 的统一重导出，避免使用方版本漂移。

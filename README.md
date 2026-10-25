@@ -6,9 +6,11 @@ An array-based, async-runtime-agnostic, `no_std` MPMC channel with back pressure
 
 - **Fast path (default, plan C)**: each direction first takes a *read* lock on its
   own `CooperativeRwLock`, then competes for a slot in a Vyukov bounded sequence
-  ring. With the `hybrid` feature (plan D), `send_async`/`recv_async` skip the read
-  lock and use a per-direction congestion hint; `try_send`/`try_recv` keep the
-  read-lock path.
+  ring. If that attempt fails, `send_async`/`recv_async` retry the fast path for a
+  bounded number of spins before entering the slow path (configurable via
+  `TrConfig::FAST_SPIN`, default 512). With the `hybrid` feature (plan D),
+  `send_async`/`recv_async` skip the read lock and use a per-direction congestion
+  hint; `try_send`/`try_recv` keep the read-lock path and never spin.
 - **Slow path**: if the ring is full/empty (or the direction lock is busy), the
   operation releases the read lock, queues as a **writer** on the same direction
   lock, and — once admitted — parks while **holding** that direction write lock.
@@ -34,6 +36,17 @@ assert_eq!(rx.try_recv(), Ok(1));
 // Async: `.await` or `.may_cancel_with(token)`.
 // let value = rx.recv_async().await?;
 
+// Custom tuning: `TrConfig` selects the direction-lock allocator and the
+// bounded fast-path spin budget. `new_in` takes an allocator value.
+// use mpmc_chan::{DefaultConfig, TrConfig};
+// struct FastSpin;
+// impl TrConfig for FastSpin {
+//     type Alloc = <DefaultConfig as TrConfig>::Alloc;
+//     const FAST_SPIN: usize = 32;
+// }
+// let alloc = <<FastSpin as TrConfig>::Alloc as Default>::default();
+// let (tx, rx) = MpmcChan::<u32, 8, _, FastSpin>::new_in(&mut buf, alloc);
+
 // A `'static` buffer needs a mutable place; an immutable
 // `static BUF: MpmcBuf<...>` cannot produce `&mut`. For example:
 // let buf: &'static mut MpmcBuf<u32, 8> = Box::leak(Box::new(MpmcBuf::new()));
@@ -53,8 +66,12 @@ capacity 1 correctly). A borrowed buffer must outlive all senders/receivers/futu
   crossbeam-channel and crossbeam-queue for async and try/spin workloads; see
   the provisional results and caveats in
   `dev-notes/mpmc-design-20261025-1535.md` §8.5.
-- The first results show the async slow path, not the ring CAS, dominates under
-  sustained full/empty; D is not a clear win, so C remains the default.
+- The async slow path, not the ring CAS, dominated under sustained full/empty.
+  A bounded fast-path spin now brings plan C at 4P4C/cap64 from ~10.2 us/item to
+  0.47-0.79 us/item (5-round medians across runs); plan D still suffers from a
+  sticky congestion hint and is not a clear win, so C remains the default.
+- `TrConfig` (default `DefaultConfig`) centralizes the direction-lock allocator
+  and the spin budget without changing `N`/`B` or the default behavior.
 
 ```sh
 cargo test

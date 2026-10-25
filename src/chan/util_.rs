@@ -8,15 +8,6 @@ use core::{
 
 use abs_cancel::TrCancellationToken;
 
-/// P1：快路径失败后、进入慢路径前的有界自旋预算（次数）。
-///
-/// 仅方案 C 使用；方案 D 的 fast 首次失败即置拥塞位，自旋没有可成功窗口。
-///
-/// 自旋只做「再试一次快路径」，不排队、不持锁；预算必须远小于一次 park/wake
-/// 的调度成本，同时足以覆盖对向刚释放槽位的窗口。
-#[cfg(not(feature = "hybrid"))]
-pub(super) const FAST_SPIN_BUDGET: usize = 512;
-
 /// P1：自旋中每多少次检查一次取消令牌。
 ///
 /// 自旋是同步段，没有 `.await`；取消/关闭不能只靠下一次 await 观察。每 16 次
