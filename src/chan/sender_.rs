@@ -11,7 +11,7 @@ use atomic_sync::x_deps::abs_sync::async_rwlock::{
 #[cfg(not(feature = "hybrid"))]
 use super::util_::CANCEL_CHECK_EVERY;
 
-use abs_cancel::TrCancellationToken;
+use abs_cancel::{ok_or::XtOkOr, TrCancellationToken};
 use gen_mcf2::gen_may_cancel_future;
 
 use crate::MpmcBuf;
@@ -21,7 +21,6 @@ use super::{
     core_::MpmcChan,
     error_::{SendError, TrySendError},
     metrics_::metric_,
-    util_::race_cancel_into_,
 };
 
 /// 生产端句柄。
@@ -257,24 +256,32 @@ where
     // 一层 poll_fn，避免为计数给正式路径增加间接调用。
     #[cfg(mpmc_metrics)]
     let wait_result = {
+        let child = cancel.child_token();
         let mut wait = core::pin::pin!(core::future::IntoFuture::into_future(
             sess.write_async()
         ));
-        race_cancel_into_(
-            &cancel,
-            core::future::poll_fn(|cx| {
+        child
+            .cancellation()
+            .ok_or(core::future::poll_fn(|cx| {
                 let poll = core::future::Future::poll(wait.as_mut(), cx);
                 match poll {
                     Poll::Pending => metric_!(PUSH_SLOW_LOCK_PARK),
                     Poll::Ready(_) => metric_!(PUSH_SLOW_LOCK_READY),
                 }
                 poll
-            }),
-        )
-        .await
+            }))
+            .await
+            .err()
     };
     #[cfg(not(mpmc_metrics))]
-    let wait_result = race_cancel_into_(&cancel, sess.write_async()).await;
+    let wait_result = {
+        let child = cancel.child_token();
+        child
+            .cancellation()
+            .ok_or(core::future::IntoFuture::into_future(sess.write_async()))
+            .await
+            .err()
+    };
     let Some(result) = wait_result else {
         metric_!(PUSH_SLOW_CANCEL);
         return Result::Err(SendError::Cancelled(item));
@@ -307,19 +314,20 @@ where
         }
 
         // 环仍满（或目标槽尚未回收）：登记 not_full 并 park。
-        // 取消时 race_cancel_into_ 丢弃等待 future，guard 在返回时释放。
-        let notified = race_cancel_into_(
-            &cancel,
-            core::future::poll_fn(|cx| {
+        // 取消时 ok_or 丢弃等待 future，guard 在返回时释放。
+        let child = cancel.child_token();
+        let notified = child
+            .cancellation()
+            .ok_or(core::future::poll_fn(|cx| {
                 let poll = sender.core_.not_full_.poll_wait_(cx);
                 match poll {
                     Poll::Pending => metric_!(PUSH_SLOW_PARK),
                     Poll::Ready(()) => metric_!(PUSH_SLOW_WAKE),
                 }
                 poll
-            }),
-        )
-        .await;
+            }))
+            .await
+            .err();
         if notified.is_none() {
             metric_!(PUSH_SLOW_CANCEL);
             return Result::Err(SendError::Cancelled(item));
