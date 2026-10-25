@@ -6,25 +6,24 @@ description = "Array-based async-runtime-agnostic no_std MPMC channel."
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 
-# 开发期使用本工作区的 path 依赖，避免远端 Gitee 镜像与本地实现不同步。
-# 发布/交付前应改为固定 rev 的 git 依赖；示例：
-#   abs_cancel = { git = "https://gitee.com/lino_snsalias/cancel_rs.git", rev = "..." }
-#   atomic_sync = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git", rev = "..." }
-#   gen_mcf2 = { git = "https://gitee.com/lino_snsalias/cancel_rs.git", rev = "..." }
 [features]
 default = []
 # 方案 D：拥塞位 + 仅 async 慢路径取方向锁。默认关闭（方案 C）。
 hybrid = []
 
 [dependencies]
-abs_cancel = { path = "../cancel_rs/abs_cancel-rs" }
-atomic_sync = { path = "../abs_sync.rs/atomic_sync" }
-gen_mcf2 = { path = "../cancel_rs/gen_mcf2" }
+# 依赖指向 Gitee 的默认分支；发布前应加 rev（或提交 Cargo.lock）固定版本。
+# 注意：本机 cargo git db 只读时，离线构建需要已缓存的 checkout。
+abs_cancel = { git = "https://gitee.com/lino_snsalias/cancel_rs.git" }
+atomic_sync = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git" }
+gen_mcf2 = { git = "https://gitee.com/lino_snsalias/cancel_rs.git" }
 
 [dev-dependencies]
 futures-lite = "2"
+flume = "0.12"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
 
-# `abs_sync`（atomic_sync 的依赖）仍从 Gitee 拉 abs_cancel；开发机上的 cargo git db
-# 是只读的，因此用 patch 把同一个包指到本地 path。发布前应改为固定 rev 并删除本段。
-[patch."https://gitee.com/lino_snsalias/cancel_rs.git"]
-abs_cancel = { path = "../cancel_rs/abs_cancel-rs" }
+[[bench]]
+name = "mpmc_compare"
+harness = false
