@@ -374,15 +374,19 @@ fn custom_config_() {
 
     struct Spin32Config;
     impl TrConfig for Spin32Config {
-        type Alloc = <DefaultConfig as TrConfig>::Alloc;
+        type ChanAlloc = <DefaultConfig as TrConfig>::ChanAlloc;
+        type ProdAlloc = <DefaultConfig as TrConfig>::ProdAlloc;
+        type ConsAlloc = <DefaultConfig as TrConfig>::ConsAlloc;
         const FAST_SPIN: usize = 32;
     }
 
     assert_eq!(Spin32Config::FAST_SPIN, 32);
 
     let mut buf = MpmcBuf::<u32, 4>::new();
-    let alloc = <<Spin32Config as TrConfig>::Alloc as Default>::default();
-    let (tx, rx) = MpmcChan::<u32, 4, _, Spin32Config>::new_in(&mut buf, alloc);
+    let chan = <<Spin32Config as TrConfig>::ChanAlloc as Default>::default();
+    let prod = <<Spin32Config as TrConfig>::ProdAlloc as Default>::default();
+    let cons = <<Spin32Config as TrConfig>::ConsAlloc as Default>::default();
+    let (tx, rx) = MpmcChan::<u32, 4, _, Spin32Config>::new_in(&mut buf, chan, prod, cons);
 
     assert_eq!(tx.try_send(7), Ok(()));
     assert_eq!(rx.try_recv(), Ok(7));

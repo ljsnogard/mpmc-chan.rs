@@ -19,9 +19,10 @@
 //!
 //! # 调教
 //!
-//! 两把方向锁的 allocator 与 async 快路径自旋预算由 [`TrConfig`] 决定，默认
-//! [`DefaultConfig`] = 全局分配器 + 512 次自旋。`MpmcChan` 的最后一个类型参数
-//! 是配置类型；自定义配置用 `MpmcChan::<..., C>::new_in(buf, alloc)` 构造。
+//! 外层 `Arc`、生产方向锁、消费方向锁各自的 allocator 与 async 快路径自旋
+//! 预算由 [`TrConfig`] 决定，默认 [`DefaultConfig`] = 三处全局分配器 + 512 次
+//! 自旋。`MpmcChan` 的最后一个类型参数是配置类型；自定义配置用
+//! `MpmcChan::<..., C>::new_in(buf, chan_alloc, prod_alloc, cons_alloc)` 构造。
 //! 容量 `N` 与 buffer 载体 `B` 仍是独立参数。
 //!
 //! # 示例

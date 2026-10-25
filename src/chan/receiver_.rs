@@ -1,7 +1,12 @@
 //! 消费端句柄与异步接收。
 
 use alloc::sync::Arc;
-use core::{borrow::BorrowMut, sync::atomic::Ordering, task::Poll};
+use core::{
+    alloc::AllocatorClone,
+    borrow::BorrowMut,
+    sync::atomic::Ordering,
+    task::Poll,
+};
 
 
 #[cfg(not(feature = "hybrid"))]
@@ -39,17 +44,21 @@ pub struct Receiver<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>, C = Defaul
 where
     B: BorrowMut<MpmcBuf<T, N>>,
     C: TrConfig,
+    C::ProdAlloc: AllocatorClone,
+    C::ConsAlloc: AllocatorClone,
 {
-    core_: Arc<MpmcChan<'a, T, N, B, C>>,
+    core_: Arc<MpmcChan<'a, T, N, B, C>, C::ChanAlloc>,
 }
 
 impl<'a, T, const N: usize, B, C> Receiver<'a, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
     C: TrConfig,
+    C::ProdAlloc: AllocatorClone,
+    C::ConsAlloc: AllocatorClone,
 {
     /// 内部构造：增加接收端句柄计数。
-    pub(super) fn new_(core_: Arc<MpmcChan<'a, T, N, B, C>>) -> Self {
+    pub(super) fn new_(core_: Arc<MpmcChan<'a, T, N, B, C>, C::ChanAlloc>) -> Self {
         core_.receivers_.fetch_add(1, Ordering::Relaxed);
         Receiver { core_ }
     }
@@ -154,6 +163,8 @@ impl<T, const N: usize, B, C> Clone for Receiver<'_, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
     C: TrConfig,
+    C::ProdAlloc: AllocatorClone,
+    C::ConsAlloc: AllocatorClone,
 {
     fn clone(&self) -> Self {
         self.core_.receivers_.fetch_add(1, Ordering::Relaxed);
@@ -167,6 +178,8 @@ impl<T, const N: usize, B, C> Drop for Receiver<'_, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
     C: TrConfig,
+    C::ProdAlloc: AllocatorClone,
+    C::ConsAlloc: AllocatorClone,
 {
     fn drop(&mut self) {
         let old = self.core_.receivers_.fetch_sub(1, Ordering::AcqRel);
@@ -188,6 +201,8 @@ where
     'a: 'f,
     B: BorrowMut<MpmcBuf<T, N>>,
     Cfg: TrConfig,
+    Cfg::ProdAlloc: AllocatorClone,
+    Cfg::ConsAlloc: AllocatorClone,
     C: TrCancellationToken,
 {
     if cancel.is_cancelled() {

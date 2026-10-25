@@ -41,11 +41,16 @@ assert_eq!(rx.try_recv(), Ok(1));
 // use mpmc_chan::{DefaultConfig, TrConfig};
 // struct FastSpin;
 // impl TrConfig for FastSpin {
-//     type Alloc = <DefaultConfig as TrConfig>::Alloc;
+//     type ChanAlloc = <DefaultConfig as TrConfig>::ChanAlloc;
+//     type ProdAlloc = <DefaultConfig as TrConfig>::ProdAlloc;
+//     type ConsAlloc = <DefaultConfig as TrConfig>::ConsAlloc;
 //     const FAST_SPIN: usize = 32;
 // }
-// let alloc = <<FastSpin as TrConfig>::Alloc as Default>::default();
-// let (tx, rx) = MpmcChan::<u32, 8, _, FastSpin>::new_in(&mut buf, alloc);
+// let chan = <<FastSpin as TrConfig>::ChanAlloc as Default>::default();
+// let prod = <<FastSpin as TrConfig>::ProdAlloc as Default>::default();
+// let cons = <<FastSpin as TrConfig>::ConsAlloc as Default>::default();
+// let (tx, rx) =
+//     MpmcChan::<u32, 8, _, FastSpin>::new_in(&mut buf, chan, prod, cons);
 
 // A `'static` buffer needs a mutable place; an immutable
 // `static BUF: MpmcBuf<...>` cannot produce `&mut`. For example:
@@ -70,8 +75,9 @@ capacity 1 correctly). A borrowed buffer must outlive all senders/receivers/futu
   A bounded fast-path spin now brings plan C at 4P4C/cap64 from ~10.2 us/item to
   0.47-0.79 us/item (5-round medians across runs); plan D still suffers from a
   sticky congestion hint and is not a clear win, so C remains the default.
-- `TrConfig` (default `DefaultConfig`) centralizes the direction-lock allocator
-  and the spin budget without changing `N`/`B` or the default behavior.
+- `TrConfig` (default `DefaultConfig`) centralizes the outer `Arc` allocator
+  (`ChanAlloc`), the two direction-lock allocators (`ProdAlloc`/`ConsAlloc`) and
+  the spin budget, without changing `N`/`B` or the default behavior.
 
 ```sh
 cargo test

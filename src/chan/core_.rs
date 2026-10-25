@@ -2,6 +2,7 @@
 
 use alloc::sync::Arc;
 use core::{
+    alloc::AllocatorClone,
     borrow::BorrowMut,
     marker::PhantomData,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -64,10 +65,15 @@ enum Push_<T> {
 ///
 /// # 调教（`C`）
 ///
-/// 最后一个类型参数 `C: TrConfig` 决定两把方向锁等待队列的 allocator
-/// （`C::Alloc`）与 async 快路径自旋预算（`C::FAST_SPIN`），默认为
-/// [`DefaultConfig`]（全局分配器 + 512 次自旋）。容量 `N` 与 buffer 载体 `B`
-/// 仍是独立参数。
+/// 最后一个类型参数 `C: TrConfig` 决定外层 `Arc` 的 allocator
+/// （`C::ChanAlloc`）、生产/消费两把方向锁各自的 allocator（`C::ProdAlloc` /
+/// `C::ConsAlloc`）与 async 快路径自旋预算（`C::FAST_SPIN`），默认为
+/// [`DefaultConfig`]（三处都是全局分配器 + 512 次自旋）。容量 `N` 与 buffer
+/// 载体 `B` 仍是独立参数。
+///
+/// 注意：`cooperative_arena` 的锁实现内部还有 `Arc`，因此具体 `MpmcChan` 类型
+/// 额外要求 `C::ProdAlloc: AllocatorClone` 与 `C::ConsAlloc: AllocatorClone`；
+/// `TrConfig` 本身只按锁的基础要求声明 `Allocator + Clone`。
 ///
 /// # 方案 D（`hybrid` feature）
 ///
@@ -105,10 +111,12 @@ pub struct MpmcChan<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>, C = Defaul
 where
     B: BorrowMut<MpmcBuf<T, N>>,
     C: TrConfig,
+    C::ProdAlloc: AllocatorClone,
+    C::ConsAlloc: AllocatorClone,
 {
     pub(super) buf_: B,
-    pub(super) prod_gate_: CooperativeRwLockOwned<(), AtomicUsize, StrictOrderings, C::Alloc>,
-    pub(super) cons_gate_: CooperativeRwLockOwned<(), AtomicUsize, StrictOrderings, C::Alloc>,
+    pub(super) prod_gate_: CooperativeRwLockOwned<(), AtomicUsize, StrictOrderings, C::ProdAlloc>,
+    pub(super) cons_gate_: CooperativeRwLockOwned<(), AtomicUsize, StrictOrderings, C::ConsAlloc>,
     pub(super) not_full_: WakerSlot,
     pub(super) not_empty_: WakerSlot,
     pub(super) senders_: AtomicUsize,
@@ -128,6 +136,8 @@ where
 impl<'a, T, const N: usize, B> MpmcChan<'a, T, N, B, DefaultConfig>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
+    <DefaultConfig as TrConfig>::ProdAlloc: AllocatorClone,
+    <DefaultConfig as TrConfig>::ConsAlloc: AllocatorClone,
 {
     /// 用 buffer 构造一对通道句柄（默认 [`DefaultConfig`]）。
     ///
@@ -158,7 +168,9 @@ where
     ) {
         Self::new_in(
             buf,
-            <<DefaultConfig as TrConfig>::Alloc as Default>::default(),
+            <<DefaultConfig as TrConfig>::ChanAlloc as Default>::default(),
+            <<DefaultConfig as TrConfig>::ProdAlloc as Default>::default(),
+            <<DefaultConfig as TrConfig>::ConsAlloc as Default>::default(),
         )
     }
 }
@@ -167,11 +179,14 @@ impl<'a, T, const N: usize, B, C> MpmcChan<'a, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
     C: TrConfig,
+    C::ProdAlloc: AllocatorClone,
+    C::ConsAlloc: AllocatorClone,
 {
-    /// 用 buffer 与显式 allocator 构造一对通道句柄。
+    /// 用 buffer 与三处 allocator 构造一对通道句柄。
     ///
-    /// 两把方向锁各拿一份 `alloc.clone()`；`MpmcChan` 外层 `Arc` 仍使用全局
-    /// 分配器。带状态（非 `Default`）的 allocator 用这个入口。
+    /// `chan_alloc` 交给外层 `Arc<MpmcChan>`，`prod_alloc` / `cons_alloc` 分别
+    /// 交给生产/消费方向锁。带状态（非 `Default`）的 allocator 用这个入口；
+    /// 三处可以是不同类型。
     ///
     /// # Examples
     ///
@@ -179,43 +194,51 @@ where
     /// use mpmc_chan::{DefaultConfig, MpmcBuf, MpmcChan, TrConfig};
     ///
     /// let mut buf = MpmcBuf::<u8, 2>::new();
-    /// let alloc = <<DefaultConfig as TrConfig>::Alloc as Default>::default();
-    /// let (tx, rx) = MpmcChan::<u8, 2, _, DefaultConfig>::new_in(&mut buf, alloc);
+    /// let chan = <<DefaultConfig as TrConfig>::ChanAlloc as Default>::default();
+    /// let prod = <<DefaultConfig as TrConfig>::ProdAlloc as Default>::default();
+    /// let cons = <<DefaultConfig as TrConfig>::ConsAlloc as Default>::default();
+    /// let (tx, rx) =
+    ///     MpmcChan::<u8, 2, _, DefaultConfig>::new_in(&mut buf, chan, prod, cons);
     /// tx.try_send(1).unwrap();
     /// assert_eq!(rx.try_recv(), Ok(1));
     /// ```
     pub fn new_in(
         mut buf: B,
-        alloc: C::Alloc,
+        chan_alloc: C::ChanAlloc,
+        prod_alloc: C::ProdAlloc,
+        cons_alloc: C::ConsAlloc,
     ) -> (Sender<'a, T, N, B, C>, Receiver<'a, T, N, B, C>) {
         buf.borrow_mut().drop_remaining_();
 
-        let core = Arc::new(MpmcChan {
-            buf_: buf,
-            prod_gate_: CooperativeRwLockOwned::<
-                (),
-                AtomicUsize,
-                StrictOrderings,
-                C::Alloc,
-            >::new_owned_in((), alloc.clone()),
-            cons_gate_: CooperativeRwLockOwned::<
-                (),
-                AtomicUsize,
-                StrictOrderings,
-                C::Alloc,
-            >::new_owned_in((), alloc),
-            not_full_: WakerSlot::new_(),
-            not_empty_: WakerSlot::new_(),
-            senders_: AtomicUsize::new(0),
-            receivers_: AtomicUsize::new(0),
-            tx_closed_: AtomicBool::new(false),
-            rx_closed_: AtomicBool::new(false),
-            #[cfg(feature = "hybrid")]
-            prod_congested_: AtomicBool::new(false),
-            #[cfg(feature = "hybrid")]
-            cons_congested_: AtomicBool::new(false),
-            _lt_: PhantomData,
-        });
+        let core = Arc::new_in(
+            MpmcChan {
+                buf_: buf,
+                prod_gate_: CooperativeRwLockOwned::<
+                    (),
+                    AtomicUsize,
+                    StrictOrderings,
+                    C::ProdAlloc,
+                >::new_owned_in((), prod_alloc),
+                cons_gate_: CooperativeRwLockOwned::<
+                    (),
+                    AtomicUsize,
+                    StrictOrderings,
+                    C::ConsAlloc,
+                >::new_owned_in((), cons_alloc),
+                not_full_: WakerSlot::new_(),
+                not_empty_: WakerSlot::new_(),
+                senders_: AtomicUsize::new(0),
+                receivers_: AtomicUsize::new(0),
+                tx_closed_: AtomicBool::new(false),
+                rx_closed_: AtomicBool::new(false),
+                #[cfg(feature = "hybrid")]
+                prod_congested_: AtomicBool::new(false),
+                #[cfg(feature = "hybrid")]
+                cons_congested_: AtomicBool::new(false),
+                _lt_: PhantomData,
+            },
+            chan_alloc,
+        );
 
         let tx = Sender::new_(Arc::clone(&core));
         let rx = Receiver::new_(Arc::clone(&core));
@@ -489,6 +512,8 @@ impl<T, const N: usize, B, C> Drop for MpmcChan<'_, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
     C: TrConfig,
+    C::ProdAlloc: AllocatorClone,
+    C::ConsAlloc: AllocatorClone,
 {
     fn drop(&mut self) {
         // 走到这里说明所有 Sender/Receiver/Future 都已经消失，不可能有在途操作。
