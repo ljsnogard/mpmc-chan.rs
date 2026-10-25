@@ -1,6 +1,6 @@
 //! 通道层测试：构造/复用、关闭/drain、异步满/空唤醒、取消、克隆计数。
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 
 use abs_cancel::{CancelledToken, NonCancellableToken, TrMayCancel};
 use futures_lite::future::block_on;
@@ -210,6 +210,74 @@ fn clone_last_close_() {
     assert_eq!(rx.try_recv(), Ok(9));
     drop(tx2);
     assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
+}
+
+/// 测试目标：4 生产者/4 消费者通过异步 send/recv 并发跑完整条通道，不丢不重。
+/// 手段：容量 64；每个生产者发送 500 个递增标签；消费者 block_on(recv_async) 直到 Closed；
+///       主线程先 drop 自己的句柄，让最后一个生产者退出后触发关闭。
+/// 判断：所有线程 join 成功；消费总数 = 2000；消费值总和 = 0..2000 的总和。
+/// Test goal: 4 producers/4 consumers exercise async send/recv concurrently without loss.
+/// Method: capacity 64; each producer sends 500 tagged values; consumers block_on(recv_async)
+///         until Closed; main drops its own handles so the last producer closes the channel.
+/// Assertion: all threads join; total received = 2000; sum matches 0..2000.
+#[test]
+fn async_channel_stress_() {
+    const PRODUCERS: usize = 4;
+    const CONSUMERS: usize = 4;
+    const PER_PRODUCER: usize = 500;
+    const TOTAL: usize = PRODUCERS * PER_PRODUCER;
+
+    let buf = leak_buf_::<usize, 64>();
+    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+
+    let mut handles = Vec::new();
+    for p in 0..PRODUCERS {
+        let tx = tx.clone();
+        handles.push(std::thread::spawn(move || {
+            for n in 0..PER_PRODUCER {
+                let value = p * PER_PRODUCER + n;
+                block_on(async { tx.send_async(value).await }).expect("send_async");
+            }
+        }));
+    }
+
+    let mut consumers = Vec::new();
+    for _ in 0..CONSUMERS {
+        let rx = rx.clone();
+        consumers.push(std::thread::spawn(move || {
+            let mut count = 0usize;
+            let mut sum = 0usize;
+            loop {
+                match block_on(async { rx.recv_async().await }) {
+                    Ok(value) => {
+                        count += 1;
+                        sum += value;
+                    }
+                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Cancelled) => panic!("不可取消路径不应返回 Cancelled"),
+                }
+            }
+            (count, sum)
+        }));
+    }
+
+    // 主线程不再持有句柄：最后一个生产者退出后，通道自然关闭。
+    drop(tx);
+    drop(rx);
+
+    for h in handles {
+        h.join().expect("producer 线程不应 panic");
+    }
+    let mut total_count = 0usize;
+    let mut total_sum = 0usize;
+    for h in consumers {
+        let (count, sum) = h.join().expect("consumer 线程不应 panic");
+        total_count += count;
+        total_sum += sum;
+    }
+
+    assert_eq!(total_count, TOTAL);
+    assert_eq!(total_sum, (0..TOTAL).sum::<usize>());
 }
 
 /// 测试目标：确认公开句柄/内核满足 Send+Sync（T: Send 时）。
