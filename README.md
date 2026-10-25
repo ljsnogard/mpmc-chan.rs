@@ -77,21 +77,22 @@ capacity 1 correctly). A borrowed buffer must outlive all senders/receivers/futu
   configuration GATs were removed.
 - Tests: 40 unit tests + 15 doc tests, including multi-waiter FIFO,
   close-wakes-all, cancellation/reclaim and cross-chunk SlabList cases.
-- Comparison on the same machine (`BENCH_OPS=20000`, 5 rounds, medians, ns/item):
+- Comparison on the same machine (`BENCH_OPS=20000`, medians, ns/item; the
+  2026-10-26 3-round rerun matching `dev-notes/mpmc-bench-20261025-1803.md`):
 
-  | scenario | previous P1 (rwlock) | SlabList wait queue |
+  | scenario | previous P1 (rwlock, 5-round) | SlabList wait queue (3-round) |
   | --- | ---: | ---: |
-  | 1P1C cap64 async | 290.6 | 134.7 |
-  | 1P1C cap64 try | 339.8 | 82.4 |
-  | 2P2C cap64 async | 325.2 | 250.6 |
-  | 2P2C cap64 try | 378.5 | 235.6 |
-  | 2P2C cap1024 async | 317.5 | 253.2 |
-  | 2P2C cap1024 try | 380.7 | 222.3 |
-  | 4P4C cap64 async | 457.1 | 313.4 |
-  | 4P4C cap64 try | 727.9 | 396.7 |
+  | 1P1C cap64 async | 290.6 | 270.7 |
+  | 1P1C cap64 try | 339.8 | 182.2 |
+  | 2P2C cap64 async | 325.2 | 262.5 |
+  | 2P2C cap64 try | 378.5 | 198.7 |
+  | 2P2C cap1024 async | 317.5 | 267.7 |
+  | 2P2C cap1024 try | 380.7 | 275.2 |
+  | 4P4C cap64 async | 457.1 | 308.4 |
+  | 4P4C cap64 try | 727.9 | 587.2 |
 
-  Raw CSVs and the causal discussion are in
-  `dev-notes/mpmc-waitqueue-20261026-0245.md`.
+  4P4C/cap64 `try` varies across rounds (475–628 ns); raw CSVs, per-round values
+  and the causal discussion are in `dev-notes/mpmc-waitqueue-20261026-0245.md`.
 
 ```sh
 cargo test

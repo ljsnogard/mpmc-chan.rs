@@ -13,9 +13,10 @@
   3. 代价是同方向 FIFO 从“严格写者优先”退化为**近似公平**：快路径可以插队到
      已 park 的等待者之前，等待者被唤醒后也要重新竞争。这是本设计明确接受的
      取舍，已写入 crate 文档。
-  4. 实测（同机、同参数、5 轮中位数）：1P1C/cap64 async 290.6 → 134.7 ns/item，
-     try 339.8 → 82.4 ns/item；4P4C/cap64 async 457.1 → 313.4 ns/item，
-     try 727.9 → 396.7 ns/item；其余配置也全部下降。
+  4. 实测（同机、同参数、2026-10-26 3 轮重跑中位数）：1P1C/cap64 async
+     290.6 → 270.7 ns/item，try 339.8 → 182.2 ns/item；4P4C/cap64 async
+     457.1 → 308.4 ns/item，try 727.9 → 587.2 ns/item；其余配置也全部下降。
+     4P4C 的 try 轮间波动较大（475–628 ns），详见 §6。
 
 ## 1. 背景：为什么必须去掉写者优先
 
@@ -131,27 +132,30 @@ cargo clippy --offline --all-targets
 命令（同机 4 核，`taskset -c 0-3`）：
 
 ```sh
-BENCH_OPS=20000 BENCH_ROUNDS=5 BENCH_WARMUP=1 \
-BENCH_PRODUCERS=<P> BENCH_CONSUMERS=<C> BENCH_CAP=<N> BENCH_IMPLS=mpmc \
-taskset -c 0-3 cargo bench --offline --bench mpmc_compare
+BENCH_OPS=20000 BENCH_ROUNDS=3 BENCH_WARMUP=1 \
+BENCH_PRODUCERS=<P> BENCH_CONSUMERS=<C> BENCH_CAP=<N> \
+cargo bench --offline --bench mpmc_compare
 ```
 
-原始 CSV：`mpmc-chan/.tmp/waitq-bench-20261026/`；旧实现数据取自
-`.tmp/p1-final-20261025-235154/`。下表是 5 轮中位数（ns/item）。
+原始 CSV：`mpmc-chan/.tmp/bench-rerun-20261026/`（本轮 3 轮重跑，匹配
+`mpmc-bench-20261025-1803.md` 的命令）；5 轮批次在
+`.tmp/waitq-bench-20261026/`；旧实现数据取自 `.tmp/p1-final-20261025-235154/`。
+下表是 3 轮中位数（ns/item）。
 
 | 配置 | 旧 P1 async | 新实现 async | 旧 P1 try | 新实现 try |
 | --- | ---: | ---: | ---: | ---: |
-| 1P1C cap64 | 290.6 | 134.7 | 339.8 | 82.4 |
-| 2P2C cap64 | 325.2 | 250.6 | 378.5 | 235.6 |
-| 2P2C cap1024 | 317.5 | 253.2 | 380.7 | 222.3 |
-| 4P4C cap64 | 457.1 | 313.4 | 727.9 | 396.7 |
+| 1P1C cap64 | 290.6 | 270.7 | 339.8 | 182.2 |
+| 2P2C cap64 | 325.2 | 262.5 | 378.5 | 198.7 |
+| 2P2C cap1024 | 317.5 | 267.7 | 380.7 | 275.2 |
+| 4P4C cap64 | 457.1 | 308.4 | 727.9 | 587.2 |
 
 观察：
 
 - 低竞争（1P1C）提升最大：快路径不再有方向读锁 RMW，`try` 路径只剩一次 CAS；
 - 高竞争（4P4C）提升仍然明显，且不再出现旧实现“写者队列自维持”导致的双稳态；
-- 新实现 4P4C/try 的 p95（约 600 ns）高于中位数，说明个别轮次仍有调度噪声；
-  需要更严格的结论时，应增加轮数并固定 CPU 频率。
+- 新实现 4P4C/try 的轮间值为 475.3 / 587.2 / 627.8 ns，p95 为 627.8 ns；
+  3 轮样本下中位数仍偏高，说明该配置对调度噪声敏感，需要更严格的结论时应
+  增加轮数并固定 CPU 频率。
 
 ## 7. 语义变化与风险
 
