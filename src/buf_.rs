@@ -9,16 +9,17 @@
 //! 生产者发布的值相同，生产者将无法区分「消费者还没读」与「消费者已读完」，
 //! 从而覆盖正在读取的值。因此 Vyukov 环要求 `N >= 2`；容量 1 不在本实现范围。
 //!
-//! # claim / reset
+//! # 独占与 reset
 //!
-//! buffer 是借用给 channel 的，`static` 无法安全地提供 `&mut`。因此用
-//! [`MpmcBuf::claimed_`] 原子位做运行时独占：一个 buffer 同时只允许一个 channel。
-//! channel 构造时 claim 并 reset，Drop 时 drain、reset 并释放 claim。
+//! channel 通过 **owned `MpmcBuf`** 或 **`&mut MpmcBuf`** 借用获得独占访问；不再
+//! 需要运行时 claim 位。构造时 reset，Drop 时 drain + reset；`MpmcBuf` 本身不实现
+//! `Drop`。不可变 `static BUF` 无法安全地产生 `&mut`，因此需要 `static mut` /
+//! `Box::leak` 一类手段；详见 `MpmcChan` 的文档。
 
 use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 /// 环中的一个槽位。
@@ -70,8 +71,6 @@ pub struct MpmcBuf<T, const N: usize> {
     slots_: [Slot<T>; N],
     head_: AtomicUsize,
     tail_: AtomicUsize,
-    /// `false` 表示未被 channel 占用；`true` 表示已有一个存活的 channel。
-    claimed_: AtomicBool,
 }
 
 impl<T, const N: usize> MpmcBuf<T, N> {
@@ -95,7 +94,6 @@ impl<T, const N: usize> MpmcBuf<T, N> {
             slots_: slots,
             head_: AtomicUsize::new(0),
             tail_: AtomicUsize::new(0),
-            claimed_: AtomicBool::new(false),
         }
     }
 
@@ -116,23 +114,10 @@ impl<T, const N: usize> MpmcBuf<T, N> {
         tail.wrapping_sub(head)
     }
 
-    /// 尝试 claim 本 buffer；成功返回 `true`。
-    #[inline]
-    pub(crate) fn claim_(&self) -> bool {
-        self.claimed_
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    /// 释放 claim。调用前必须已经 drain + reset，且不能有并发的 channel 使用者。
-    #[inline]
-    pub(crate) fn release_(&self) {
-        self.claimed_.store(false, Ordering::Release);
-    }
-
     /// 重置为空环：`head = tail = 0`，槽位 `seq = 0..N`。
     ///
-    /// 调用者必须持有 claim，且保证没有并发的 push/pop。
+    /// 调用者必须拥有该 buffer 的独占访问（owned 或 `&mut`），且保证没有并发的
+    /// push/pop。
     #[inline]
     pub(crate) fn reset_(&self) {
         for (i, slot) in self.slots_.iter().enumerate() {
@@ -140,13 +125,6 @@ impl<T, const N: usize> MpmcBuf<T, N> {
         }
         self.head_.store(0, Ordering::Relaxed);
         self.tail_.store(0, Ordering::Relaxed);
-    }
-
-    /// 环是否被某个 channel 占用（测试/诊断用）。
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn is_claimed_(&self) -> bool {
-        self.claimed_.load(Ordering::Acquire)
     }
 
     /// 尝试入队一个元素；满时把元素原样还回。
@@ -245,8 +223,7 @@ impl<T, const N: usize> MpmcBuf<T, N> {
 
     /// 丢弃环内所有已发布但尚未消费的元素，并把 buffer 重置为空。
     ///
-    /// 只能在 channel Drop（所有句柄与 Future 都已消失）时调用；此时不可能有
-    /// 并发的 push/pop。
+    /// 只能在 channel 构造/Drop（或测试）且保证没有并发 push/pop 时调用。
     pub(crate) fn drop_remaining_(&self) {
         let head = self.head_.load(Ordering::Relaxed);
         let tail = self.tail_.load(Ordering::Relaxed);
@@ -279,8 +256,9 @@ impl<T, const N: usize> Default for MpmcBuf<T, N> {
 unsafe impl<T: Send, const N: usize> Send for MpmcBuf<T, N> {}
 
 // SAFETY: `&MpmcBuf` 只通过 crate 内部的 Vyukov 协议读写槽位：任一时刻一个
-// 槽位只属于一个生产者或一个消费者；`claimed` 保证同一 buffer 只有一个 channel。
-// 跨线程移动 T 要求 T: Send；T 不需要 Sync，因为不会把 &T 共享给多个线程。
+// 槽位只属于一个生产者或一个消费者；channel 通过 owned `MpmcBuf` 或 `&mut`
+// 借用保证一个 buffer 只有一个 channel。跨线程移动 T 要求 T: Send；T 不需要
+// Sync，因为不会把 &T 共享给多个线程。
 unsafe impl<T: Send, const N: usize> Sync for MpmcBuf<T, N> {}
 
 #[cfg(test)]
@@ -326,26 +304,22 @@ mod tests_ {
         assert_eq!(buf.try_pop_(), Some(3));
     }
 
-    /// 测试目标：验证 claim/release/reset 的独占与复用语义。
-    /// 手段：同一 buffer 连续 claim 两次；release 后再次 claim；reset 后检查空。
-    /// 判断：第一次 claim 成功、第二次失败；release 后 claim 成功；reset 后 pop 为 None。
-    /// Test goal: verify claim/release/reset exclusivity and reuse.
-    /// Method: claim twice, release, claim again, then reset and inspect.
-    /// Assertion: first claim succeeds, second fails; after release claim succeeds; reset empties.
+    /// 测试目标：验证 reset 清空空 buffer，drop_remaining_ 清空有元素的 buffer。
+    /// 手段：空 buffer 先 reset；push 一个值后调用 drop_remaining_，再 pop。
+    /// 判断：reset 后 pop 为 None；push 后 len=1；drop_remaining_ 后 pop 为 None。
+    /// Test goal: verify reset on empty and drop_remaining_ on a non-empty buffer.
+    /// Method: reset an empty buffer; push a value, call drop_remaining_, then pop.
+    /// Assertion: pop is None after reset; len=1 after push; pop is None after drop_remaining_.
     #[test]
-    fn claim_release_reset_() {
+    fn reset_empty_() {
         let buf = MpmcBuf::<u32, 4>::new();
-        assert!(buf.claim_());
-        assert!(!buf.claim_());
-        buf.reset_();
-        buf.release_();
-        assert!(!buf.is_claimed_());
-        assert!(buf.claim_());
-        assert_eq!(buf.try_push_(9), Ok(()));
-        assert_eq!(buf.len_(), 1);
         buf.reset_();
         assert!(buf.try_pop_().is_none());
-        buf.release_();
+
+        assert_eq!(buf.try_push_(9), Ok(()));
+        assert_eq!(buf.len_(), 1);
+        buf.drop_remaining_();
+        assert!(buf.try_pop_().is_none());
     }
 
     /// 测试目标：验证 `try_pop_state_` 能区分「已预留未发布」与「真空」。
@@ -414,17 +388,15 @@ mod tests_ {
 
     /// 测试目标：验证 const 构造可用于 static，且容量/初始状态正确。
     /// 手段：定义 `static BUF: MpmcBuf<u64, 8> = MpmcBuf::new()`。
-    /// 判断：capacity() == 8；初始 claim 成功且 pop 为 None。
+    /// 判断：capacity() == 8；初始 pop 为 None。
     /// Test goal: verify const construction works for a static buffer.
     /// Method: define a static MpmcBuf via MpmcBuf::new().
-    /// Assertion: capacity() == 8; initial claim succeeds and pop is None.
+    /// Assertion: capacity() == 8; initial pop is None.
     #[test]
     fn const_static_() {
         static BUF: MpmcBuf<u64, 8> = MpmcBuf::new();
         assert_eq!(BUF.capacity(), 8);
-        assert!(BUF.claim_());
         assert_eq!(BUF.try_pop_(), None);
-        BUF.release_();
     }
 
     /// 测试目标：多生产者/多消费者并发下不丢不重、总数正确。
@@ -441,7 +413,6 @@ mod tests_ {
         const TOTAL: usize = PRODUCERS * PER_PRODUCER;
 
         let buf = Arc::new(MpmcBuf::<usize, 64>::new());
-        assert!(buf.claim_());
         let consumed = Arc::new(AtomicUsize::new(0));
         let sum = Arc::new(AtomicUsize::new(0));
 

@@ -13,27 +13,32 @@ An array-based, async-runtime-agnostic, `no_std` MPMC channel with back pressure
   a consumer (and vice versa).
 - Only one waiter per direction can be parked, so each direction needs just one
   single-waiter notification slot. Same-direction waiters are FIFO.
-- The buffer is borrowed from the caller (`static`, `Box`, or a stack value) and
-  claimed by the channel at construction; one buffer can serve only one live
-  channel.
+- The buffer is passed through `BorrowMut<MpmcBuf>`: the channel can own it
+  (`MpmcBuf`, `Box<MpmcBuf>`) or borrow it as `&mut MpmcBuf`. Ownership/the `&mut`
+  borrow guarantees that one buffer serves only one live channel; there is no
+  runtime claim flag.
 
 ## Usage
 
 ```rust
 use mpmc_chan::{MpmcBuf, MpmcChan};
 
-static BUF: MpmcBuf<u32, 8> = MpmcBuf::new();
-
-let (tx, rx) = MpmcChan::new(&BUF).expect("buffer already in use");
+let mut buf = MpmcBuf::<u32, 8>::new();
+let (tx, rx) = MpmcChan::new(&mut buf);
 tx.try_send(1).unwrap();
 assert_eq!(rx.try_recv(), Ok(1));
 
 // Async: `.await` or `.may_cancel_with(token)`.
 // let value = rx.recv_async().await?;
+
+// A `'static` buffer needs a mutable place; an immutable
+// `static BUF: MpmcBuf<...>` cannot produce `&mut`. For example:
+// let buf: &'static mut MpmcBuf<u32, 8> = Box::leak(Box::new(MpmcBuf::new()));
+// let (tx, rx) = MpmcChan::new(buf);
 ```
 
 `N` must be a power of two and `N >= 2` (Vyukov's sequence ring cannot represent
-capacity 1 correctly). The buffer must outlive all senders/receivers/futures.
+capacity 1 correctly). A borrowed buffer must outlive all senders/receivers/futures.
 
 ## Status
 

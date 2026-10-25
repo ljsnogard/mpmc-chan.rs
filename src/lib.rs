@@ -8,18 +8,18 @@
 //!   对向使用另一把锁，因此仍能推进；
 //! - 每方向只有一个 park 者，所以只需要一个单等待者 waker 槽。
 //!
-//! 底层缓冲 [`MpmcBuf`] 由调用方提供（可以是 `static`、`Box` 或栈上值）。channel
-//! 构造时通过 [`MpmcBuf`] 内部的一个原子位完成独占 claim；同一个 buffer 同时只能
-//! 对应一个 channel，重复构造返回 [`ChanBuildError::BufferInUse`]。
+//! 底层缓冲 [`MpmcBuf`] 由调用方提供，channel 通过 `BorrowMut<MpmcBuf>` 接收：
+//! owned `MpmcBuf` / `Box<MpmcBuf>`，或 `&mut MpmcBuf`。独占性由所有权/`&mut`
+//! 借用保证，不需要运行时 claim。不可变 `static BUF` 不能安全产生 `&mut`，需要
+//! `static mut` / `Box::leak` 一类手段。
 //!
 //! # 示例
 //!
 //! ```
 //! use mpmc_chan::{MpmcBuf, MpmcChan};
 //!
-//! static BUF: MpmcBuf<u32, 4> = MpmcBuf::new();
-//!
-//! let (tx, rx) = MpmcChan::new(&BUF).expect("buffer 已被占用");
+//! let mut buf = MpmcBuf::<u32, 4>::new();
+//! let (tx, rx) = MpmcChan::new(&mut buf);
 //! tx.try_send(7).unwrap();
 //! assert_eq!(rx.try_recv(), Ok(7));
 //! ```
@@ -43,8 +43,8 @@ pub mod chan;
 
 pub use buf_::MpmcBuf;
 pub use chan::{
-    ChanBuildError, MpmcChan, Receiver, RecvAsync, RecvError, RecvFuture, SendAsync, SendError,
-    SendFuture, Sender, TryRecvError, TrySendError,
+    MpmcChan, Receiver, RecvAsync, RecvError, RecvFuture, SendAsync, SendError, SendFuture, Sender,
+    TryRecvError, TrySendError,
 };
 
 /// 本 crate 依赖的外部 crate 的统一重导出，避免使用方版本漂移。

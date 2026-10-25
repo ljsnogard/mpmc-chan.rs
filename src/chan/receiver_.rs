@@ -1,12 +1,12 @@
 //! 消费端句柄与异步接收。
 
 use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
+use core::{borrow::BorrowMut, sync::atomic::Ordering};
 
 use abs_cancel::TrCancellationToken;
 use gen_mcf2::gen_may_cancel_future;
 
-use crate::buf_::Pop_;
+use crate::{MpmcBuf, buf_::Pop_};
 
 use super::{
     core_::{MpmcChan, TryPop_},
@@ -24,18 +24,24 @@ use super::{
 /// ```
 /// use mpmc_chan::{MpmcBuf, MpmcChan};
 ///
-/// let buf = MpmcBuf::<u32, 2>::new();
-/// let (tx, rx) = MpmcChan::new(&buf).expect("首次构造应成功");
+/// let mut buf = MpmcBuf::<u32, 2>::new();
+/// let (tx, rx) = MpmcChan::new(&mut buf);
 /// tx.try_send(1).unwrap();
 /// assert_eq!(rx.try_recv(), Ok(1));
 /// ```
-pub struct Receiver<'a, T, const N: usize> {
-    core_: Arc<MpmcChan<'a, T, N>>,
+pub struct Receiver<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>>
+where
+    B: BorrowMut<MpmcBuf<T, N>>,
+{
+    core_: Arc<MpmcChan<'a, T, N, B>>,
 }
 
-impl<'a, T, const N: usize> Receiver<'a, T, N> {
+impl<'a, T, const N: usize, B> Receiver<'a, T, N, B>
+where
+    B: BorrowMut<MpmcBuf<T, N>>,
+{
     /// 内部构造：增加接收端句柄计数。
-    pub(super) fn new_(core_: Arc<MpmcChan<'a, T, N>>) -> Self {
+    pub(super) fn new_(core_: Arc<MpmcChan<'a, T, N, B>>) -> Self {
         core_.receivers_.fetch_add(1, Ordering::Relaxed);
         Receiver { core_ }
     }
@@ -54,8 +60,8 @@ impl<'a, T, const N: usize> Receiver<'a, T, N> {
     /// ```
     /// use mpmc_chan::{MpmcBuf, MpmcChan, TryRecvError};
     ///
-    /// let buf = MpmcBuf::<u8, 2>::new();
-    /// let (tx, rx) = MpmcChan::new(&buf).unwrap();
+    /// let mut buf = MpmcBuf::<u8, 2>::new();
+    /// let (tx, rx) = MpmcChan::new(&mut buf);
     /// assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     /// tx.try_send(1).unwrap();
     /// assert_eq!(rx.try_recv(), Ok(1));
@@ -97,12 +103,12 @@ impl<'a, T, const N: usize> Receiver<'a, T, N> {
     /// use futures_lite::future::block_on;
     /// use mpmc_chan::{MpmcBuf, MpmcChan};
     ///
-    /// let buf = MpmcBuf::<u8, 2>::new();
-    /// let (tx, rx) = MpmcChan::new(&buf).unwrap();
+    /// let mut buf = MpmcBuf::<u8, 2>::new();
+    /// let (tx, rx) = MpmcChan::new(&mut buf);
     /// tx.try_send(7).unwrap();
     /// assert_eq!(block_on(async { rx.recv_async().await }), Ok(7));
     /// ```
-    pub fn recv_async<'f>(&'f self) -> RecvAsync<'a, 'f, 'f, T, N>
+    pub fn recv_async<'f>(&'f self) -> RecvAsync<'a, 'f, 'f, T, B, N>
     where
         'a: 'f,
     {
@@ -136,7 +142,10 @@ impl<'a, T, const N: usize> Receiver<'a, T, N> {
     }
 }
 
-impl<T, const N: usize> Clone for Receiver<'_, T, N> {
+impl<T, const N: usize, B> Clone for Receiver<'_, T, N, B>
+where
+    B: BorrowMut<MpmcBuf<T, N>>,
+{
     fn clone(&self) -> Self {
         self.core_.receivers_.fetch_add(1, Ordering::Relaxed);
         Receiver {
@@ -145,7 +154,10 @@ impl<T, const N: usize> Clone for Receiver<'_, T, N> {
     }
 }
 
-impl<T, const N: usize> Drop for Receiver<'_, T, N> {
+impl<T, const N: usize, B> Drop for Receiver<'_, T, N, B>
+where
+    B: BorrowMut<MpmcBuf<T, N>>,
+{
     fn drop(&mut self) {
         let old = self.core_.receivers_.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(old > 0, "Receiver 句柄计数下溢");
@@ -158,12 +170,13 @@ impl<T, const N: usize> Drop for Receiver<'_, T, N> {
 
 /// 异步接收流程；由 `gen_mcf2` 生成 `RecvAsync` / `RecvFuture` 两件套。
 #[gen_may_cancel_future(Recv, pub, new(pub(crate)))]
-async fn recv_async_<'a, 'f, T, const N: usize, C>(
-    receiver: &'f Receiver<'a, T, N>,
+async fn recv_async_<'a, 'f, T, B, const N: usize, C>(
+    receiver: &'f Receiver<'a, T, N, B>,
     cancel: C,
 ) -> Result<T, RecvError>
 where
     'a: 'f,
+    B: BorrowMut<MpmcBuf<T, N>>,
     C: TrCancellationToken,
 {
     if cancel.is_cancelled() {
@@ -197,7 +210,7 @@ where
     };
 
     loop {
-        match receiver.core_.buf_.try_pop_state_() {
+        match receiver.core_.buf_.borrow().try_pop_state_() {
             Pop_::Value(value) => {
                 drop(guard);
                 receiver.core_.not_full_.notify_();

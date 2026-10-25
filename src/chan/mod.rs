@@ -11,7 +11,7 @@ mod util_;
 mod waker_;
 
 pub use core_::MpmcChan;
-pub use error_::{ChanBuildError, RecvError, SendError, TryRecvError, TrySendError};
+pub use error_::{RecvError, SendError, TryRecvError, TrySendError};
 pub use receiver_::Receiver;
 /// 异步接收参数载体；可直接 `.await`，或先 `.may_cancel_with(token)`。
 pub use receiver_::{RecvAsync, RecvFuture};

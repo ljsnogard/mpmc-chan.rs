@@ -1,10 +1,12 @@
 //! 生产端句柄与异步发送。
 
 use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
+use core::{borrow::BorrowMut, sync::atomic::Ordering};
 
 use abs_cancel::TrCancellationToken;
 use gen_mcf2::gen_may_cancel_future;
+
+use crate::MpmcBuf;
 
 use super::{
     core_::MpmcChan,
@@ -22,18 +24,24 @@ use super::{
 /// ```
 /// use mpmc_chan::{MpmcBuf, MpmcChan};
 ///
-/// let buf = MpmcBuf::<u32, 2>::new();
-/// let (tx, rx) = MpmcChan::new(&buf).expect("首次构造应成功");
+/// let mut buf = MpmcBuf::<u32, 2>::new();
+/// let (tx, rx) = MpmcChan::new(&mut buf);
 /// tx.try_send(1).unwrap();
 /// assert_eq!(rx.try_recv(), Ok(1));
 /// ```
-pub struct Sender<'a, T, const N: usize> {
-    core_: Arc<MpmcChan<'a, T, N>>,
+pub struct Sender<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>>
+where
+    B: BorrowMut<MpmcBuf<T, N>>,
+{
+    core_: Arc<MpmcChan<'a, T, N, B>>,
 }
 
-impl<'a, T, const N: usize> Sender<'a, T, N> {
+impl<'a, T, const N: usize, B> Sender<'a, T, N, B>
+where
+    B: BorrowMut<MpmcBuf<T, N>>,
+{
     /// 内部构造：增加发送端句柄计数。
-    pub(super) fn new_(core_: Arc<MpmcChan<'a, T, N>>) -> Self {
+    pub(super) fn new_(core_: Arc<MpmcChan<'a, T, N, B>>) -> Self {
         core_.senders_.fetch_add(1, Ordering::Relaxed);
         Sender { core_ }
     }
@@ -51,8 +59,8 @@ impl<'a, T, const N: usize> Sender<'a, T, N> {
     /// ```
     /// use mpmc_chan::{MpmcBuf, MpmcChan, TrySendError};
     ///
-    /// let buf = MpmcBuf::<u8, 2>::new();
-    /// let (tx, rx) = MpmcChan::new(&buf).unwrap();
+    /// let mut buf = MpmcBuf::<u8, 2>::new();
+    /// let (tx, rx) = MpmcChan::new(&mut buf);
     /// assert_eq!(tx.try_send(1), Ok(()));
     /// assert_eq!(tx.try_send(2), Ok(()));
     /// assert_eq!(tx.try_send(3), Err(TrySendError::Full(3)));
@@ -95,12 +103,12 @@ impl<'a, T, const N: usize> Sender<'a, T, N> {
     /// use futures_lite::future::block_on;
     /// use mpmc_chan::{MpmcBuf, MpmcChan};
     ///
-    /// let buf = MpmcBuf::<u8, 2>::new();
-    /// let (tx, rx) = MpmcChan::new(&buf).unwrap();
+    /// let mut buf = MpmcBuf::<u8, 2>::new();
+    /// let (tx, rx) = MpmcChan::new(&mut buf);
     /// assert_eq!(block_on(async { tx.send_async(7).await }), Ok(()));
     /// assert_eq!(rx.try_recv(), Ok(7));
     /// ```
-    pub fn send_async<'f>(&'f self, item: T) -> SendAsync<'a, 'f, 'f, T, N>
+    pub fn send_async<'f>(&'f self, item: T) -> SendAsync<'a, 'f, 'f, T, B, N>
     where
         'a: 'f,
     {
@@ -134,7 +142,10 @@ impl<'a, T, const N: usize> Sender<'a, T, N> {
     }
 }
 
-impl<T, const N: usize> Clone for Sender<'_, T, N> {
+impl<T, const N: usize, B> Clone for Sender<'_, T, N, B>
+where
+    B: BorrowMut<MpmcBuf<T, N>>,
+{
     fn clone(&self) -> Self {
         self.core_.senders_.fetch_add(1, Ordering::Relaxed);
         Sender {
@@ -143,7 +154,10 @@ impl<T, const N: usize> Clone for Sender<'_, T, N> {
     }
 }
 
-impl<T, const N: usize> Drop for Sender<'_, T, N> {
+impl<T, const N: usize, B> Drop for Sender<'_, T, N, B>
+where
+    B: BorrowMut<MpmcBuf<T, N>>,
+{
     fn drop(&mut self) {
         let old = self.core_.senders_.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(old > 0, "Sender 句柄计数下溢");
@@ -156,13 +170,14 @@ impl<T, const N: usize> Drop for Sender<'_, T, N> {
 
 /// 异步发送流程；由 `gen_mcf2` 生成 `SendAsync` / `SendFuture` 两件套。
 #[gen_may_cancel_future(Send, pub, new(pub(crate)))]
-async fn send_async_<'a, 'f, T, const N: usize, C>(
-    sender: &'f Sender<'a, T, N>,
+async fn send_async_<'a, 'f, T, B, const N: usize, C>(
+    sender: &'f Sender<'a, T, N, B>,
     item: T,
     cancel: C,
 ) -> Result<(), SendError<T>>
 where
     'a: 'f,
+    B: BorrowMut<MpmcBuf<T, N>>,
     C: TrCancellationToken,
 {
     if cancel.is_cancelled() {
@@ -197,7 +212,7 @@ where
             return Result::Err(SendError::Closed(item));
         }
 
-        match sender.core_.buf_.try_push_(item) {
+        match sender.core_.buf_.borrow().try_push_(item) {
             Result::Ok(()) => {
                 drop(guard);
                 sender.core_.not_empty_.notify_();

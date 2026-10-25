@@ -5,10 +5,10 @@ use alloc::{boxed::Box, vec::Vec};
 use abs_cancel::{CancelledToken, NonCancellableToken, TrMayCancel};
 use futures_lite::future::block_on;
 
-use crate::{ChanBuildError, MpmcBuf, MpmcChan, RecvError, SendError, TryRecvError, TrySendError};
+use crate::{MpmcBuf, MpmcChan, RecvError, SendError, TryRecvError, TrySendError};
 
 /// 泄漏一个 buffer 以获得 `'static` 借用，便于把句柄 move 进测试线程。
-fn leak_buf_<T, const N: usize>() -> &'static MpmcBuf<T, N> {
+fn leak_buf_<T, const N: usize>() -> &'static mut MpmcBuf<T, N> {
     Box::leak(Box::new(MpmcBuf::new()))
 }
 
@@ -21,7 +21,7 @@ fn leak_buf_<T, const N: usize>() -> &'static MpmcBuf<T, N> {
 #[test]
 fn build_and_try_() {
     let buf = leak_buf_::<u32, 4>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+    let (tx, rx) = MpmcChan::new(buf);
 
     assert_eq!(tx.capacity(), 4);
     assert_eq!(rx.capacity(), 4);
@@ -36,25 +36,35 @@ fn build_and_try_() {
     assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
 }
 
-/// 测试目标：验证同一个 buffer 不能被两个存活 channel 同时占用，但释放后可复用。
-/// 手段：构造第一个 channel；再构造第二个；drop 第一个句柄后再构造。
-/// 判断：第二次返回 BufferInUse；drop 后第三次成功。
-/// Test goal: verify a buffer is exclusive to one live channel and reusable after release.
-/// Method: build channel A, try channel B, drop A, then build C.
-/// Assertion: B returns BufferInUse; C succeeds.
+/// 测试目标：验证 `MpmcChan::new` 接受 owned `MpmcBuf`（`BorrowMut` 的拥有型载体）。
+/// 手段：把 `MpmcBuf` 按值交给 `MpmcChan::new`，发送并接收一个元素。
+/// 判断：发送/接收成功；channel 拥有 buffer，无需运行时 claim。
+/// Test goal: verify `MpmcChan::new` accepts an owned `MpmcBuf` (BorrowMut owned carrier).
+/// Method: move a `MpmcBuf` into `MpmcChan::new`, then send/recv one value.
+/// Assertion: send/recv succeed; the channel owns the buffer without a runtime claim.
 #[test]
-fn buffer_in_use_and_reuse_() {
-    let buf = leak_buf_::<u8, 2>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
-    assert!(matches!(
-        MpmcChan::new(buf),
-        Err(ChanBuildError::BufferInUse)
-    ));
+fn owned_buffer_() {
+    let buf = MpmcBuf::<u8, 2>::new();
+    let (tx, rx) = MpmcChan::new(buf);
+    tx.try_send(1).unwrap();
+    assert_eq!(rx.try_recv(), Ok(1));
+}
 
-    drop(tx);
-    drop(rx);
+/// 测试目标：验证 `BorrowMut<MpmcBuf>` 也能接受 `static mut` 放置的 buffer。
+/// 手段：`static mut BUF` 用 `addr_of_mut!` 取得 `&'static mut`，再交给 `MpmcChan::new`。
+/// 判断：静态 buffer 上的 send/recv 正常。不可变 `static BUF` 不在此测试范围。
+/// Test goal: verify `BorrowMut<MpmcBuf>` accepts a `static mut` buffer.
+/// Method: obtain `&'static mut` from `static mut BUF` via `addr_of_mut!`, pass to new.
+/// Assertion: send/recv on the static buffer succeed. Immutable `static BUF` is not covered.
+#[test]
+fn static_buffer_() {
+    static mut BUF: MpmcBuf<u32, 2> = MpmcBuf::new();
 
-    let (_tx2, _rx2) = MpmcChan::new(buf).expect("释放后应可复用");
+    // SAFETY: 本测试独占这个 static；没有其他线程访问 BUF。
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
+    let (tx, rx) = MpmcChan::new(buf);
+    tx.try_send(11).unwrap();
+    assert_eq!(rx.try_recv(), Ok(11));
 }
 
 /// 测试目标：最后一个 Sender 退出后，Receiver 先 drain 再收到 Closed。
@@ -66,7 +76,7 @@ fn buffer_in_use_and_reuse_() {
 #[test]
 fn sender_drop_drains_then_closed_() {
     let buf = leak_buf_::<u32, 4>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+    let (tx, rx) = MpmcChan::new(buf);
     tx.try_send(1).unwrap();
     tx.try_send(2).unwrap();
     drop(tx);
@@ -85,7 +95,7 @@ fn sender_drop_drains_then_closed_() {
 #[test]
 fn receiver_close_drains_() {
     let buf = leak_buf_::<u32, 4>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+    let (tx, rx) = MpmcChan::new(buf);
     tx.try_send(1).unwrap();
     tx.try_send(2).unwrap();
     rx.close();
@@ -105,7 +115,7 @@ fn receiver_close_drains_() {
 #[test]
 fn receiver_drop_closes_sender_() {
     let buf = leak_buf_::<u32, 2>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+    let (tx, rx) = MpmcChan::new(buf);
     tx.try_send(1).unwrap();
     drop(rx);
 
@@ -122,7 +132,7 @@ fn receiver_drop_closes_sender_() {
 #[test]
 fn async_full_wakes_() {
     let buf = leak_buf_::<u32, 2>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+    let (tx, rx) = MpmcChan::new(buf);
     tx.try_send(1).unwrap();
     tx.try_send(2).unwrap();
 
@@ -145,7 +155,7 @@ fn async_full_wakes_() {
 #[test]
 fn async_empty_wakes_() {
     let buf = leak_buf_::<u32, 2>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+    let (tx, rx) = MpmcChan::new(buf);
 
     let consumer =
         std::thread::spawn(move || block_on(async { rx.recv_async().await }).expect("recv_async"));
@@ -164,7 +174,7 @@ fn async_empty_wakes_() {
 #[test]
 fn cancel_immediate_() {
     let buf = leak_buf_::<u32, 2>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+    let (tx, rx) = MpmcChan::new(buf);
     tx.try_send(1).unwrap();
     tx.try_send(2).unwrap();
 
@@ -185,7 +195,7 @@ fn cancel_immediate_() {
 #[test]
 fn non_cancellable_roundtrip_() {
     let buf = leak_buf_::<u32, 2>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+    let (tx, rx) = MpmcChan::new(buf);
 
     let sent = block_on(tx.send_async(5).may_cancel_with(NonCancellableToken::new()));
     assert_eq!(sent, Ok(()));
@@ -202,7 +212,7 @@ fn non_cancellable_roundtrip_() {
 #[test]
 fn clone_last_close_() {
     let buf = leak_buf_::<u32, 2>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+    let (tx, rx) = MpmcChan::new(buf);
     let tx2 = tx.clone();
     drop(tx);
 
@@ -228,7 +238,7 @@ fn async_channel_stress_() {
     const TOTAL: usize = PRODUCERS * PER_PRODUCER;
 
     let buf = leak_buf_::<usize, 64>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+    let (tx, rx) = MpmcChan::new(buf);
 
     let mut handles = Vec::new();
     for p in 0..PRODUCERS {
@@ -290,14 +300,30 @@ fn async_channel_stress_() {
 fn handles_are_send_sync_() {
     fn assert_send_sync<T: Send + Sync>() {}
     fn assert_send<T: Send>() {}
-    assert_send_sync::<crate::MpmcChan<'static, u32, 4>>();
-    assert_send_sync::<crate::Sender<'static, u32, 4>>();
-    assert_send_sync::<crate::Receiver<'static, u32, 4>>();
+    assert_send_sync::<crate::MpmcChan<'static, u32, 4, MpmcBuf<u32, 4>>>();
+    assert_send_sync::<crate::Sender<'static, u32, 4, MpmcBuf<u32, 4>>>();
+    assert_send_sync::<crate::Receiver<'static, u32, 4, MpmcBuf<u32, 4>>>();
     assert_send::<
-        crate::SendFuture<'static, 'static, 'static, u32, 4, abs_cancel::NonCancellableToken>,
+        crate::SendFuture<
+            'static,
+            'static,
+            'static,
+            u32,
+            MpmcBuf<u32, 4>,
+            4,
+            abs_cancel::NonCancellableToken,
+        >,
     >();
     assert_send::<
-        crate::RecvFuture<'static, 'static, 'static, u32, 4, abs_cancel::NonCancellableToken>,
+        crate::RecvFuture<
+            'static,
+            'static,
+            'static,
+            u32,
+            MpmcBuf<u32, 4>,
+            4,
+            abs_cancel::NonCancellableToken,
+        >,
     >();
 }
 
@@ -310,7 +336,7 @@ fn handles_are_send_sync_() {
 #[test]
 fn async_recv_closed_() {
     let buf = leak_buf_::<u32, 2>();
-    let (tx, rx) = MpmcChan::new(buf).expect("首次构造应成功");
+    let (tx, rx) = MpmcChan::new(buf);
     drop(tx);
     assert_eq!(
         block_on(async { rx.recv_async().await }),

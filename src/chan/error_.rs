@@ -2,23 +2,6 @@
 
 use core::fmt;
 
-/// 构造通道时的错误。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChanBuildError {
-    /// 传入的 [`MpmcBuf`](crate::MpmcBuf) 已被另一个存活的 channel 占用。
-    BufferInUse,
-}
-
-impl fmt::Display for ChanBuildError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ChanBuildError::BufferInUse => f.write_str("该 MpmcBuf 已被另一个 channel 占用"),
-        }
-    }
-}
-
-impl core::error::Error for ChanBuildError {}
-
 /// 非阻塞发送失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrySendError<T> {
