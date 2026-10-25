@@ -348,6 +348,40 @@ mod tests_ {
         buf.release_();
     }
 
+    /// 测试目标：验证 `try_pop_state_` 能区分「已预留未发布」与「真空」。
+    /// 手段：手动把 tail 从 0 推进到 1（模拟生产者已 CAS 领取位置但尚未写值），
+    ///       先检查 Pending，再手动写入 value/seq，检查 Value；最后消费后检查 Empty。
+    /// 判断：第一次为 Pending，第二次为 Value(7)，第三次为 Empty。
+    /// Test goal: verify `try_pop_state_` distinguishes reserved-unpublished from truly empty.
+    /// Method: manually advance tail 0 -> 1, check Pending; publish value/seq, check Value;
+    ///         consume, then check Empty.
+    /// Assertion: Pending, then Value(7), then Empty.
+    #[test]
+    fn pop_state_pending_empty_() {
+        use core::mem::MaybeUninit;
+        use core::sync::atomic::Ordering;
+
+        use super::Pop_;
+
+        let buf = MpmcBuf::<u32, 2>::new();
+        assert_eq!(
+            buf.tail_
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed),
+            Ok(0)
+        );
+
+        assert!(matches!(buf.try_pop_state_(), Pop_::Pending));
+
+        // SAFETY: 测试单线程；模拟生产者自己写入预留位置并发布。
+        unsafe {
+            buf.slots_[0].value_.get().write(MaybeUninit::new(7));
+        }
+        buf.slots_[0].seq_.store(1, Ordering::Release);
+
+        assert!(matches!(buf.try_pop_state_(), Pop_::Value(7)));
+        assert!(matches!(buf.try_pop_state_(), Pop_::Empty));
+    }
+
     /// 测试目标：验证 Drop 路径会析构所有已发布未消费的元素，并重置为空。
     /// 手段：用一个带 Drop 计数的类型 push 3 个元素，调用 drop_remaining_。
     /// 判断：Drop 计数变为 3；随后 pop 为 None；再次 push 可用。
