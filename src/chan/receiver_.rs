@@ -44,7 +44,8 @@ impl<'a, T, const N: usize> Receiver<'a, T, N> {
     ///
     /// # Errors
     ///
-    /// - [`TryRecvError::Empty`]：环空，或消费方向锁当前被慢写者/短临界区占用；
+    /// - [`TryRecvError::Empty`]：环空、头槽已预留但生产者尚未发布，或消费方向锁
+    ///   当前被慢写者/短临界区占用；
     /// - [`TryRecvError::Closed`]：通道已关闭且没有更多元素。已入队的元素会先被
     ///   drain，因此不会因为关闭而丢弃。
     ///

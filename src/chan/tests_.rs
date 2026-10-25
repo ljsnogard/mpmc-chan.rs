@@ -280,18 +280,25 @@ fn async_channel_stress_() {
     assert_eq!(total_sum, (0..TOTAL).sum::<usize>());
 }
 
-/// 测试目标：确认公开句柄/内核满足 Send+Sync（T: Send 时）。
-/// 手段：编译期调用 `assert_send_sync::<...>()`。
+/// 测试目标：确认公开句柄/内核满足 Send+Sync，异步 Future 满足 Send。
+/// 手段：编译期调用 `assert_send_sync::<...>()` 与 `assert_send::<...>()`。
 /// 判断：若任一类型不满足，编译失败。
-/// Test goal: compile-time check that handles/core are Send+Sync for T: Send.
-/// Method: instantiate assert_send_sync for the public types.
+/// Test goal: compile-time check handles/core are Send+Sync and async futures are Send.
+/// Method: instantiate assert_send_sync / assert_send for the public types.
 /// Assertion: compilation fails if any bound is missing.
 #[test]
 fn handles_are_send_sync_() {
     fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send<T: Send>() {}
     assert_send_sync::<crate::MpmcChan<'static, u32, 4>>();
     assert_send_sync::<crate::Sender<'static, u32, 4>>();
     assert_send_sync::<crate::Receiver<'static, u32, 4>>();
+    assert_send::<
+        crate::SendFuture<'static, 'static, 'static, u32, 4, abs_cancel::NonCancellableToken>,
+    >();
+    assert_send::<
+        crate::RecvFuture<'static, 'static, 'static, u32, 4, abs_cancel::NonCancellableToken>,
+    >();
 }
 
 /// 测试目标：验证 `RecvError` 在关闭后的异步接收路径上正确返回。

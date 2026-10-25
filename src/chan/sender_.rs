@@ -42,8 +42,8 @@ impl<'a, T, const N: usize> Sender<'a, T, N> {
     ///
     /// # Errors
     ///
-    /// - [`TrySendError::Full`]：环满，或生产方向锁当前被慢写者/短临界区占用；
-    ///   元素原样返回。
+    /// - [`TrySendError::Full`]：环满、目标槽尚未回收，或生产方向锁当前被
+    ///   慢写者/短临界区占用；元素原样返回。
     /// - [`TrySendError::Closed`]：接收侧已关闭，或发送侧已显式关闭；元素原样返回。
     ///
     /// # Examples

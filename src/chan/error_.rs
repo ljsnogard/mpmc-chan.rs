@@ -22,7 +22,8 @@ impl core::error::Error for ChanBuildError {}
 /// 非阻塞发送失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrySendError<T> {
-    /// 当前无法发送：环满，或生产方向锁被慢写者/短临界区占用。元素原样返回。
+    /// 当前无法发送：环满、目标槽尚未回收，或生产方向锁被慢写者/短临界区占用。
+    /// 元素原样返回。
     Full(T),
     /// 接收侧已关闭（或发送侧已显式关闭）。元素原样返回。
     Closed(T),
@@ -62,7 +63,8 @@ impl<T: fmt::Debug> core::error::Error for SendError<T> {}
 /// 非阻塞接收失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TryRecvError {
-    /// 当前取不到元素：环空，或消费方向锁被慢写者/短临界区占用。
+    /// 当前取不到元素：环空、头槽已预留但生产者尚未发布，或消费方向锁被
+    /// 慢写者/短临界区占用。
     Empty,
     /// 通道已关闭且没有更多元素。
     Closed,
