@@ -36,21 +36,28 @@ assert_eq!(rx.try_recv(), Ok(1));
 // Async: `.await` or `.may_cancel_with(token)`.
 // let value = rx.recv_async().await?;
 
-// Custom tuning: `TrConfig` selects the direction-lock allocator and the
-// bounded fast-path spin budget. `new_in` takes an allocator value.
+// Custom tuning (feat/rwlock-config): `TrConfig` selects the outer Arc
+// allocator and the two lock types via GATs. `new_with_locks` takes the
+// lock instances; the lock impl must satisfy the fairness contract documented
+// on `TrConfig::ProdGate` / `TrConfig::ConsGate`.
+// use mpmc_chan::x_deps::atomic_sync::{
+//     rwlock::cooperative_arena::CooperativeRwLockOwned,
+//     x_deps::atomex::StrictOrderings,
+// };
 // use mpmc_chan::{DefaultConfig, TrConfig};
+// use std::{alloc::Global, sync::atomic::AtomicUsize};
 // struct FastSpin;
 // impl TrConfig for FastSpin {
 //     type ChanAlloc = <DefaultConfig as TrConfig>::ChanAlloc;
-//     type ProdAlloc = <DefaultConfig as TrConfig>::ProdAlloc;
-//     type ConsAlloc = <DefaultConfig as TrConfig>::ConsAlloc;
+//     type ProdGate<'a> = <DefaultConfig as TrConfig>::ProdGate<'a> where Self: 'a;
+//     type ConsGate<'a> = <DefaultConfig as TrConfig>::ConsGate<'a> where Self: 'a;
 //     const FAST_SPIN: usize = 32;
 // }
-// let chan = <<FastSpin as TrConfig>::ChanAlloc as Default>::default();
-// let prod = <<FastSpin as TrConfig>::ProdAlloc as Default>::default();
-// let cons = <<FastSpin as TrConfig>::ConsAlloc as Default>::default();
-// let (tx, rx) =
-//     MpmcChan::<u32, 8, _, FastSpin>::new_in(&mut buf, chan, prod, cons);
+// let prod = CooperativeRwLockOwned::<(), AtomicUsize, StrictOrderings, Global>::new_owned(());
+// let cons = CooperativeRwLockOwned::<(), AtomicUsize, StrictOrderings, Global>::new_owned(());
+// let (tx, rx) = MpmcChan::<u32, 8, _, FastSpin>::new_with_locks(
+//     &mut buf, Global, prod, cons,
+// );
 
 // A `'static` buffer needs a mutable place; an immutable
 // `static BUF: MpmcBuf<...>` cannot produce `&mut`. For example:
@@ -75,9 +82,11 @@ capacity 1 correctly). A borrowed buffer must outlive all senders/receivers/futu
   A bounded fast-path spin now brings plan C at 4P4C/cap64 from ~10.2 us/item to
   0.47-0.79 us/item (5-round medians across runs); plan D still suffers from a
   sticky congestion hint and is not a clear win, so C remains the default.
-- `TrConfig` (default `DefaultConfig`) centralizes the outer `Arc` allocator
-  (`ChanAlloc`), the two direction-lock allocators (`ProdAlloc`/`ConsAlloc`) and
-  the spin budget, without changing `N`/`B` or the default behavior.
+- On `feat/rwlock-config`, `TrConfig` exposes the two lock types as GATs
+  (`ProdGate<'a>`/`ConsGate<'a>`) plus the outer `Arc` allocator and spin budget;
+  custom locks are injected via `new_with_locks`. The default `new` path still
+  uses `CooperativeRwLockOwned` and the fairness contract is documented on the
+  GATs.
 
 ```sh
 cargo test

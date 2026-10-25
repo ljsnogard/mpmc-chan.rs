@@ -1,22 +1,29 @@
-//! 通道调教：方向锁 allocator 与快路径自旋预算。
+//! 通道调教：外层 Arc allocator、两把方向锁的具体类型与快路径自旋预算。
 
 use alloc::alloc::Global;
-use core::alloc::{Allocator, AllocatorClone};
+use core::{alloc::AllocatorClone, sync::atomic::AtomicUsize};
+
+use atomic_sync::{
+    rwlock::cooperative_arena::CooperativeRwLockOwned,
+    x_deps::{abs_sync::async_rwlock::TrAsyncRwLock, atomex::StrictOrderings},
+};
 
 /// 通道调教参数。
 ///
-/// 把「生产/消费两把方向锁等待队列各自使用的 allocator」和「async 快路径失败
-/// 后的有界自旋预算」收进一个类型。调用者只需要在 [`crate::MpmcChan`] 的最后
-/// 一个类型参数上选一个实现，默认是 [`DefaultConfig`]；不需要逐个传 allocator，
-/// 也不需要改库内常量。
+/// 把「外层 `Arc` 的 allocator」「生产/消费两把方向锁的具体类型」和「async 快
+/// 路径失败后的有界自旋预算」收进一个类型。调用者只需要在 [`crate::MpmcChan`]
+/// 的最后一个类型参数上选一个实现，默认是 [`DefaultConfig`]。
 ///
 /// 容量 `N` 与 buffer 载体 `B` 仍是独立类型参数：前者是 `MpmcBuf` 的编译期
 /// 容量，后者是所有权载体（owned / `&mut` / `Box`），都不属于「调教」。
 ///
+/// 两把方向锁通过 GAT 指定具体类型，因此可以替换为其他
+/// [`TrAsyncRwLock`] 实现（包括借用型锁）；实现者必须满足
+/// [`Self::ProdGate`] / [`Self::ConsGate`] 文档中的公平性契约。
+///
 /// # 稳定性
 ///
-/// 本 trait 是公开配置接口；新增关联项属于 breaking 变更。当前只有
-/// [`Self::Alloc`] 与 [`Self::FAST_SPIN`]。
+/// 本 trait 是公开配置接口；新增/修改关联项属于 breaking 变更。
 ///
 /// # Examples
 ///
@@ -33,20 +40,37 @@ pub trait TrConfig {
     /// `AllocatorClone` 这个 unsafe 等价性标记，而不是裸的 `Allocator + Clone`。
     type ChanAlloc: AllocatorClone + Send + Sync;
 
-    /// 生产方向锁等待队列（Arena）使用的 allocator。
+    /// 生产方向锁的具体类型（GAT；允许借用型锁）。
     ///
-    /// 锁本身对 allocator 的基础要求是 `Allocator + Clone`（内部会克隆
-    /// allocator 交给 Arena 节点）。注意 `cooperative_arena` 的锁实现内部还有
-    /// `Arc`，所以 `MpmcChan` 在具体类型上会额外要求 `AllocatorClone`；这里保留
-    /// 基础约束，避免把 `AllocatorClone` 当成 `Allocator + Clone` 的别名。
-    type ProdAlloc: Allocator + Clone + Send + Sync;
+    /// # 公平性契约
+    ///
+    /// [`crate::MpmcChan`] 的慢路径与 D 的拥塞位清位依赖以下语义，实现者必须
+    /// 保证：
+    ///
+    /// - 写者入队后，同方向新的 `try_read` 必须失败（写者优先），快路径不能
+    ///   插队到已排队的慢写者前面；
+    /// - 写者按 FIFO 获得写锁，WriterGuard Drop 必须唤醒/交接下一个写者；
+    /// - 写者队列非空时 `try_write` 必须失败（D 用 `try_write` 成功来判断
+    ///   「没有慢写者排队」）；
+    /// - 不允许读者在写者排队时无限插队，否则慢写者可能饿死。
+    ///
+    /// [`TrAsyncRwLock`] 只描述方法签名，不表达上述语义；不满足时 C 的防饿死
+    /// 论证和 D 的清位/公平性论证失效。默认的 `CooperativeRwLockOwned` 满足。
+    type ProdGate<'a>: TrAsyncRwLock<Target = ()> + Send + Sync
+    where
+        Self: 'a;
 
-    /// 消费方向锁等待队列（Arena）使用的 allocator。
+    /// 消费方向锁的具体类型（GAT；允许借用型锁）。
     ///
-    /// 与 [`Self::ProdAlloc`] 独立，允许两个方向使用不同 arena/allocator；
-    /// 默认配置两侧都是 `Global`。同样在 `MpmcChan` 的具体类型上额外要求
-    /// `AllocatorClone`。
-    type ConsAlloc: Allocator + Clone + Send + Sync;
+    /// # 公平性契约
+    ///
+    /// 与 [`Self::ProdGate`] 相同的契约：写者优先（写者排队时 `try_read` 失败）、
+    /// 写者 FIFO、WriterGuard Drop 交接下一个写者、写者队列非空时 `try_write`
+    /// 失败、不允许读者无限插队。消费方向的慢路径和 D 的消费拥塞位清位同样依赖
+    /// 这些语义。
+    type ConsGate<'a>: TrAsyncRwLock<Target = ()> + Send + Sync
+    where
+        Self: 'a;
 
     /// async 快路径失败后、进入慢路径前的有界自旋次数（仅方案 C）。
     ///
@@ -55,9 +79,11 @@ pub trait TrConfig {
     const FAST_SPIN: usize;
 }
 
-/// 默认调教：全局分配器 + 512 次快路径自旋。
+/// 默认调教：全局 `Arc` 分配器、两把 `CooperativeRwLockOwned`、512 次自旋。
 ///
-/// 与引入 [`TrConfig`] 之前的实现等价；不显式指定配置类型时使用它。
+/// 两把方向锁都是 `CooperativeRwLockOwned<(), AtomicUsize, StrictOrderings, Global>`，
+/// 满足 [`TrConfig::ProdGate`] / [`TrConfig::ConsGate`] 的公平性契约；不显式指定
+/// 配置类型时使用它。
 ///
 /// # Examples
 ///
@@ -74,7 +100,16 @@ pub struct DefaultConfig;
 
 impl TrConfig for DefaultConfig {
     type ChanAlloc = Global;
-    type ProdAlloc = Global;
-    type ConsAlloc = Global;
+
+    type ProdGate<'a>
+        = CooperativeRwLockOwned<(), AtomicUsize, StrictOrderings, Global>
+    where
+        Self: 'a;
+
+    type ConsGate<'a>
+        = CooperativeRwLockOwned<(), AtomicUsize, StrictOrderings, Global>
+    where
+        Self: 'a;
+
     const FAST_SPIN: usize = 512;
 }

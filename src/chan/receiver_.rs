@@ -1,11 +1,10 @@
 //! 消费端句柄与异步接收。
 
 use alloc::sync::Arc;
-use core::{
-    alloc::AllocatorClone,
-    borrow::BorrowMut,
-    sync::atomic::Ordering,
-    task::Poll,
+use core::{borrow::BorrowMut, sync::atomic::Ordering, task::Poll};
+
+use atomic_sync::x_deps::abs_sync::async_rwlock::{
+    TrAsyncRwLock, TrAsyncRwLockAcqSess,
 };
 
 
@@ -42,9 +41,7 @@ use super::{
 pub struct Receiver<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>, C = DefaultConfig>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
-    C: TrConfig,
-    C::ProdAlloc: AllocatorClone,
-    C::ConsAlloc: AllocatorClone,
+    C: TrConfig + 'a,
 {
     core_: Arc<MpmcChan<'a, T, N, B, C>, C::ChanAlloc>,
 }
@@ -52,9 +49,7 @@ where
 impl<'a, T, const N: usize, B, C> Receiver<'a, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
-    C: TrConfig,
-    C::ProdAlloc: AllocatorClone,
-    C::ConsAlloc: AllocatorClone,
+    C: TrConfig + 'a,
 {
     /// 内部构造：增加接收端句柄计数。
     pub(super) fn new_(core_: Arc<MpmcChan<'a, T, N, B, C>, C::ChanAlloc>) -> Self {
@@ -158,12 +153,10 @@ where
     }
 }
 
-impl<T, const N: usize, B, C> Clone for Receiver<'_, T, N, B, C>
+impl<'a, T, const N: usize, B, C> Clone for Receiver<'a, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
-    C: TrConfig,
-    C::ProdAlloc: AllocatorClone,
-    C::ConsAlloc: AllocatorClone,
+    C: TrConfig + 'a,
 {
     fn clone(&self) -> Self {
         self.core_.receivers_.fetch_add(1, Ordering::Relaxed);
@@ -173,12 +166,10 @@ where
     }
 }
 
-impl<T, const N: usize, B, C> Drop for Receiver<'_, T, N, B, C>
+impl<'a, T, const N: usize, B, C> Drop for Receiver<'a, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
-    C: TrConfig,
-    C::ProdAlloc: AllocatorClone,
-    C::ConsAlloc: AllocatorClone,
+    C: TrConfig + 'a,
 {
     fn drop(&mut self) {
         let old = self.core_.receivers_.fetch_sub(1, Ordering::AcqRel);
@@ -199,9 +190,7 @@ async fn recv_async_<'a, 'f, T, B, const N: usize, Cfg, C>(
 where
     'a: 'f,
     B: BorrowMut<MpmcBuf<T, N>>,
-    Cfg: TrConfig,
-    Cfg::ProdAlloc: AllocatorClone,
-    Cfg::ConsAlloc: AllocatorClone,
+    Cfg: TrConfig + 'a,
     C: TrCancellationToken,
 {
     if cancel.is_cancelled() {
@@ -264,7 +253,7 @@ where
     metric_!(POP_SLOW_ENTER);
 
     // 慢路径：排队为消费者写者。
-    let mut sess = receiver.core_.cons_gate_.acquire_session();
+    let mut sess = receiver.core_.cons_gate_.acq_session();
     // 默认构建保持原始 `write_async`；只有统计等锁 park 的 metrics 构建才加
     // 一层 poll_fn，避免为计数给正式路径增加间接调用。
     #[cfg(mpmc_metrics)]
