@@ -1,8 +1,7 @@
 //! 通道共享内核：两把方向锁、两个单等待者槽、关闭标志与句柄计数。
 
-use alloc::sync::Arc;
+use alloc::{alloc::Global, sync::Arc};
 use core::{
-    alloc::AllocatorClone,
     borrow::BorrowMut,
     marker::PhantomData,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -10,7 +9,10 @@ use core::{
 
 use atomic_sync::{
     rwlock::cooperative_arena::CooperativeRwLockOwned,
-    x_deps::atomex::StrictOrderings,
+    x_deps::{
+        abs_sync::async_rwlock::{TrAsyncRwLock, TrAsyncRwLockAcqSess},
+        atomex::StrictOrderings,
+    },
 };
 
 use crate::{MpmcBuf, buf_::Pop_};
@@ -66,14 +68,13 @@ enum Push_<T> {
 /// # 调教（`C`）
 ///
 /// 最后一个类型参数 `C: TrConfig` 决定外层 `Arc` 的 allocator
-/// （`C::ChanAlloc`）、生产/消费两把方向锁各自的 allocator（`C::ProdAlloc` /
-/// `C::ConsAlloc`）与 async 快路径自旋预算（`C::FAST_SPIN`），默认为
-/// [`DefaultConfig`]（三处都是全局分配器 + 512 次自旋）。容量 `N` 与 buffer
-/// 载体 `B` 仍是独立参数。
+/// （`C::ChanAlloc`）、生产/消费两把方向锁的具体类型（GAT
+/// `C::ProdGate<'a>` / `C::ConsGate<'a>`）与 async 快路径自旋预算
+/// （`C::FAST_SPIN`），默认为 [`DefaultConfig`]（`CooperativeRwLockOwned` +
+/// 全局分配器 + 512 次自旋）。容量 `N` 与 buffer 载体 `B` 仍是独立参数。
 ///
-/// 注意：`cooperative_arena` 的锁实现内部还有 `Arc`，因此具体 `MpmcChan` 类型
-/// 额外要求 `C::ProdAlloc: AllocatorClone` 与 `C::ConsAlloc: AllocatorClone`；
-/// `TrConfig` 本身只按锁的基础要求声明 `Allocator + Clone`。
+/// 锁类型由配置指定，因此可以换成其他 [`TrAsyncRwLock`] 实现；替换时必须满足
+/// [`TrConfig::ProdGate`] / [`TrConfig::ConsGate`] 文档中的公平性契约。
 ///
 /// # 方案 D（`hybrid` feature）
 ///
@@ -110,13 +111,11 @@ enum Push_<T> {
 pub struct MpmcChan<'a, T, const N: usize, B = &'a mut MpmcBuf<T, N>, C = DefaultConfig>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
-    C: TrConfig,
-    C::ProdAlloc: AllocatorClone,
-    C::ConsAlloc: AllocatorClone,
+    C: TrConfig + 'a,
 {
     pub(super) buf_: B,
-    pub(super) prod_gate_: CooperativeRwLockOwned<(), AtomicUsize, StrictOrderings, C::ProdAlloc>,
-    pub(super) cons_gate_: CooperativeRwLockOwned<(), AtomicUsize, StrictOrderings, C::ConsAlloc>,
+    pub(super) prod_gate_: C::ProdGate<'a>,
+    pub(super) cons_gate_: C::ConsGate<'a>,
     pub(super) not_full_: WakerSlot,
     pub(super) not_empty_: WakerSlot,
     pub(super) senders_: AtomicUsize,
@@ -136,8 +135,6 @@ where
 impl<'a, T, const N: usize, B> MpmcChan<'a, T, N, B, DefaultConfig>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
-    <DefaultConfig as TrConfig>::ProdAlloc: AllocatorClone,
-    <DefaultConfig as TrConfig>::ConsAlloc: AllocatorClone,
 {
     /// 用 buffer 构造一对通道句柄（默认 [`DefaultConfig`]）。
     ///
@@ -145,8 +142,8 @@ where
     /// 构造与 Drop 都会 drain + reset buffer。独占性由所有权/`&mut` 借用保证，
     /// 因此不存在运行时「buffer 已被占用」这一类错误。
     ///
-    /// 要换 allocator 或自旋预算，使用 [`Self::new_in`] 并显式指定配置类型
-    /// `MpmcChan<..., C>`。
+    /// 要换锁类型、allocator 或自旋预算，使用 [`Self::new_with_locks`] 并显式
+    /// 指定配置类型 `MpmcChan<..., C>`。
     ///
     /// # Examples
     ///
@@ -166,65 +163,70 @@ where
         Sender<'a, T, N, B, DefaultConfig>,
         Receiver<'a, T, N, B, DefaultConfig>,
     ) {
-        Self::new_in(
-            buf,
-            <<DefaultConfig as TrConfig>::ChanAlloc as Default>::default(),
-            <<DefaultConfig as TrConfig>::ProdAlloc as Default>::default(),
-            <<DefaultConfig as TrConfig>::ConsAlloc as Default>::default(),
-        )
+        let prod = CooperativeRwLockOwned::<
+            (),
+            AtomicUsize,
+            StrictOrderings,
+            Global,
+        >::new_owned(());
+        let cons = CooperativeRwLockOwned::<
+            (),
+            AtomicUsize,
+            StrictOrderings,
+            Global,
+        >::new_owned(());
+        Self::new_with_locks(buf, Global, prod, cons)
     }
 }
 
 impl<'a, T, const N: usize, B, C> MpmcChan<'a, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
-    C: TrConfig,
-    C::ProdAlloc: AllocatorClone,
-    C::ConsAlloc: AllocatorClone,
+    C: TrConfig + 'a,
 {
-    /// 用 buffer 与三处 allocator 构造一对通道句柄。
+    /// 用 buffer、外层 `Arc` 的 allocator 与两把具体锁实例构造通道。
     ///
-    /// `chan_alloc` 交给外层 `Arc<MpmcChan>`，`prod_alloc` / `cons_alloc` 分别
-    /// 交给生产/消费方向锁。带状态（非 `Default`）的 allocator 用这个入口；
-    /// 三处可以是不同类型。
+    /// 锁类型由 `C::ProdGate<'a>` / `C::ConsGate<'a>` 指定；调用者负责构造实例
+    /// 并保证它们满足 [`TrConfig::ProdGate`] / [`TrConfig::ConsGate`] 的公平性
+    /// 契约。默认配置可以直接用 [`Self::new`]。
     ///
     /// # Examples
     ///
     /// ```
-    /// use mpmc_chan::{DefaultConfig, MpmcBuf, MpmcChan, TrConfig};
+    /// use mpmc_chan::x_deps::atomic_sync::{
+    ///     rwlock::cooperative_arena::CooperativeRwLockOwned,
+    ///     x_deps::atomex::StrictOrderings,
+    /// };
+    /// use mpmc_chan::{DefaultConfig, MpmcBuf, MpmcChan};
+    /// use std::{alloc::Global, sync::atomic::AtomicUsize};
     ///
     /// let mut buf = MpmcBuf::<u8, 2>::new();
-    /// let chan = <<DefaultConfig as TrConfig>::ChanAlloc as Default>::default();
-    /// let prod = <<DefaultConfig as TrConfig>::ProdAlloc as Default>::default();
-    /// let cons = <<DefaultConfig as TrConfig>::ConsAlloc as Default>::default();
-    /// let (tx, rx) =
-    ///     MpmcChan::<u8, 2, _, DefaultConfig>::new_in(&mut buf, chan, prod, cons);
+    /// let prod =
+    ///     CooperativeRwLockOwned::<(), AtomicUsize, StrictOrderings, Global>::new_owned(());
+    /// let cons =
+    ///     CooperativeRwLockOwned::<(), AtomicUsize, StrictOrderings, Global>::new_owned(());
+    /// let (tx, rx) = MpmcChan::<u8, 2, _, DefaultConfig>::new_with_locks(
+    ///     &mut buf,
+    ///     Global::default(),
+    ///     prod,
+    ///     cons,
+    /// );
     /// tx.try_send(1).unwrap();
     /// assert_eq!(rx.try_recv(), Ok(1));
     /// ```
-    pub fn new_in(
+    pub fn new_with_locks(
         mut buf: B,
         chan_alloc: C::ChanAlloc,
-        prod_alloc: C::ProdAlloc,
-        cons_alloc: C::ConsAlloc,
+        prod_gate: C::ProdGate<'a>,
+        cons_gate: C::ConsGate<'a>,
     ) -> (Sender<'a, T, N, B, C>, Receiver<'a, T, N, B, C>) {
         buf.borrow_mut().drop_remaining_();
 
         let core = Arc::new_in(
             MpmcChan {
                 buf_: buf,
-                prod_gate_: CooperativeRwLockOwned::<
-                    (),
-                    AtomicUsize,
-                    StrictOrderings,
-                    C::ProdAlloc,
-                >::new_owned_in((), prod_alloc),
-                cons_gate_: CooperativeRwLockOwned::<
-                    (),
-                    AtomicUsize,
-                    StrictOrderings,
-                    C::ConsAlloc,
-                >::new_owned_in((), cons_alloc),
+                prod_gate_: prod_gate,
+                cons_gate_: cons_gate,
                 not_full_: WakerSlot::new_(),
                 not_empty_: WakerSlot::new_(),
                 senders_: AtomicUsize::new(0),
@@ -273,7 +275,7 @@ where
     /// 取生产读锁并尝试一次入队；不计数，由 fast / try 调用方分别记账。
     #[inline]
     fn try_push_read_(&self, item: T) -> Push_<T> {
-        let mut sess = self.prod_gate_.acquire_session();
+        let mut sess = self.prod_gate_.acq_session();
         let Result::Ok(_guard) = sess.try_read() else {
             return Push_::Busy(item);
         };
@@ -286,7 +288,7 @@ where
     /// 取消费读锁并尝试一次出队；不计数，由 fast / try 调用方分别记账。
     #[inline]
     fn try_pop_read_(&self) -> TryPop_<T> {
-        let mut sess = self.cons_gate_.acquire_session();
+        let mut sess = self.cons_gate_.acq_session();
         let Result::Ok(_guard) = sess.try_read() else {
             return TryPop_::Busy;
         };
@@ -468,7 +470,7 @@ where
         if !self.prod_congested_.load(Ordering::Acquire) {
             return;
         }
-        let mut sess = self.prod_gate_.acquire_session();
+        let mut sess = self.prod_gate_.acq_session();
         if let Result::Ok(_guard) = sess.try_write() {
             self.prod_congested_.store(false, Ordering::Release);
             metric_!(CONGESTED_CLEAR_PROD);
@@ -498,7 +500,7 @@ where
         if !self.cons_congested_.load(Ordering::Acquire) {
             return;
         }
-        let mut sess = self.cons_gate_.acquire_session();
+        let mut sess = self.cons_gate_.acq_session();
         if let Result::Ok(_guard) = sess.try_write() {
             self.cons_congested_.store(false, Ordering::Release);
             metric_!(CONGESTED_CLEAR_CONS);
@@ -508,12 +510,10 @@ where
     }
 }
 
-impl<T, const N: usize, B, C> Drop for MpmcChan<'_, T, N, B, C>
+impl<'a, T, const N: usize, B, C> Drop for MpmcChan<'a, T, N, B, C>
 where
     B: BorrowMut<MpmcBuf<T, N>>,
-    C: TrConfig,
-    C::ProdAlloc: AllocatorClone,
-    C::ConsAlloc: AllocatorClone,
+    C: TrConfig + 'a,
 {
     fn drop(&mut self) {
         // 走到这里说明所有 Sender/Receiver/Future 都已经消失，不可能有在途操作。
