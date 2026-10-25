@@ -50,6 +50,20 @@ fn owned_buffer_() {
     assert_eq!(rx.try_recv(), Ok(1));
 }
 
+/// 测试目标：验证 `BorrowMut<MpmcBuf>` 接受 `Box<MpmcBuf>` 载体。
+/// 手段：把 `Box<MpmcBuf>` 按值交给 `MpmcChan::new`，发送并接收。
+/// 判断：send/recv 成功；channel 通过 Box 拥有 buffer。
+/// Test goal: verify `BorrowMut<MpmcBuf>` accepts `Box<MpmcBuf>`.
+/// Method: move `Box<MpmcBuf>` into `MpmcChan::new`, then send/recv.
+/// Assertion: send/recv succeed; the channel owns the buffer through the Box.
+#[test]
+fn boxed_buffer_() {
+    let buf = Box::new(MpmcBuf::<u8, 2>::new());
+    let (tx, rx) = MpmcChan::new(buf);
+    tx.try_send(3).unwrap();
+    assert_eq!(rx.try_recv(), Ok(3));
+}
+
 /// 测试目标：验证 `BorrowMut<MpmcBuf>` 也能接受 `static mut` 放置的 buffer。
 /// 手段：`static mut BUF` 用 `addr_of_mut!` 取得 `&'static mut`，再交给 `MpmcChan::new`。
 /// 判断：静态 buffer 上的 send/recv 正常。不可变 `static BUF` 不在此测试范围。
