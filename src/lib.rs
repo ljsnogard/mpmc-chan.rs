@@ -45,6 +45,15 @@ extern crate std;
 mod buf_;
 pub mod chan;
 
+/// 基准专用计数入口；仅在 `RUSTFLAGS="--cfg mpmc_metrics"` 时编译。
+///
+/// 默认构建完全不包含该模块。它不属于公开 API，也不提供稳定性承诺；仅供
+/// `benches/mpmc_compare.rs` 读取快/慢路径比例。
+#[cfg(mpmc_metrics)]
+#[doc(hidden)]
+#[path = "metrics_.rs"]
+pub mod bench_metrics;
+
 pub use buf_::MpmcBuf;
 pub use chan::{
     MpmcChan, Receiver, RecvAsync, RecvError, RecvFuture, SendAsync, SendError, SendFuture, Sender,

@@ -14,7 +14,8 @@
 //!
 //! ```text
 //! RES,<impl>,<scenario>,<round>,<items>,<secs>,<items_per_sec>,<ns_per_item>
-//! SUM,<impl>,<scenario>,<median_ns_per_item>,<median_items_per_sec>
+//! SUM,<impl>,<scenario>,<median_ns_per_item>,<median_items_per_sec>,<p95_ns_per_item>
+//! MET,<impl>,<scenario>,<round>,<counter_name>,<value>   # 仅 --cfg mpmc_metrics
 //! ```
 //!
 //! # 运行
@@ -22,11 +23,17 @@
 //! ```sh
 //! taskset -c 0-3 cargo bench --offline --bench mpmc_compare
 //! taskset -c 0-3 cargo bench --offline --features hybrid --bench mpmc_compare
+//! # 只统计快/慢路径比例（计数会扭曲时间，不能用来测吞吐）：
+//! RUSTFLAGS="--cfg mpmc_metrics" taskset -c 0-3 cargo bench --offline --bench mpmc_compare
 //! ```
 //!
 //! 环境变量：`BENCH_OPS`（每个生产者，默认 20000）、`BENCH_ROUNDS`（默认 5）、
 //! `BENCH_PRODUCERS` / `BENCH_CONSUMERS`（默认 4/4）、`BENCH_CAP`（默认 64，
-//! mpmc-chan 只支持 8/64/1024）、`BENCH_WARMUP`（默认 1）。
+//! mpmc-chan 只支持 8/64/1024）、`BENCH_WARMUP`（默认 1）、`BENCH_IMPLS`
+//! （`all`/`mpmc`/`ext`，默认 `all`；筛选被测实现以缩短参数扫描时间）。
+//!
+//! `mpmc_metrics` 不是 Cargo feature，而是构建期 `--cfg` 开关：默认构建不编译
+//! 任何计数代码，打开后每次计数都是全局原子 RMW，只用于看比例。
 //!
 //! 这不是严格 apples-to-apples 的微基准：异步实现使用 `futures_lite::block_on`
 //! 驱动，crossbeam-channel 使用 OS 阻塞，crossbeam-queue 使用 spin。比较时请看
@@ -58,6 +65,13 @@ fn mpmc_label_() -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImplFilter_ {
+    All,
+    Mpmc,
+    Ext,
+}
+
 #[derive(Clone, Copy)]
 struct Cfg {
     ops_: usize,
@@ -66,6 +80,7 @@ struct Cfg {
     consumers_: usize,
     cap_: usize,
     warmup_: bool,
+    impls_: ImplFilter_,
 }
 
 impl Cfg {
@@ -77,6 +92,11 @@ impl Cfg {
             consumers_: env_usize_("BENCH_CONSUMERS", 4),
             cap_: env_usize_("BENCH_CAP", 64),
             warmup_: env_bool_("BENCH_WARMUP", true),
+            impls_: match env::var("BENCH_IMPLS").as_deref() {
+                Ok("mpmc") => ImplFilter_::Mpmc,
+                Ok("ext") => ImplFilter_::Ext,
+                _ => ImplFilter_::All,
+            },
         };
         assert!(cfg.ops_ > 0, "BENCH_OPS 必须 > 0");
         assert!(cfg.rounds_ > 0, "BENCH_ROUNDS 必须 > 0");
@@ -137,6 +157,31 @@ fn median_(values: &mut [f64]) -> f64 {
     }
 }
 
+/// 最近秩百分位；`values` 会被排序。
+fn percentile_(values: &mut [f64], pct: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let rank = (pct / 100.0 * values.len() as f64).ceil() as usize;
+    values[rank.saturating_sub(1).min(values.len() - 1)]
+}
+
+/// 打印本轮计数器快照（仅 `--cfg mpmc_metrics` 且被测实现是 mpmc 时）。
+#[cfg(mpmc_metrics)]
+fn print_metrics_(impl_: &str, scenario: &str, round: usize) {
+    if !impl_.starts_with("mpmc") {
+        return;
+    }
+    let snapshot = mpmc_chan::bench_metrics::snapshot();
+    let names = mpmc_chan::bench_metrics::names();
+    for (name, value) in names.iter().zip(snapshot.iter()) {
+        if *value > 0 {
+            println!("MET,{impl_},{scenario},{round},{name},{value}");
+        }
+    }
+}
+
 fn run_series_<F>(impl_: &str, scenario: &str, cfg: &Cfg, mut run_once: F)
 where
     F: FnMut(&Cfg) -> Duration,
@@ -148,17 +193,27 @@ where
 
     let mut ns_per_item = Vec::with_capacity(cfg.rounds_);
     for round in 0..cfg.rounds_ {
+        #[cfg(mpmc_metrics)]
+        if impl_.starts_with("mpmc") {
+            mpmc_chan::bench_metrics::reset();
+        }
         let elapsed = run_once(cfg);
         let items = cfg.total_();
         let secs = elapsed.as_secs_f64();
         let ns_per = secs * 1e9 / items as f64;
         let ips = items as f64 / secs;
         println!("RES,{impl_},{scenario},{round},{items},{secs:.6},{ips:.0},{ns_per:.3}");
+        #[cfg(mpmc_metrics)]
+        print_metrics_(impl_, scenario, round);
         ns_per_item.push(ns_per);
     }
 
     let median = median_(&mut ns_per_item);
-    println!("SUM,{impl_},{scenario},{median:.3},{:.0}", 1e9 / median);
+    let p95 = percentile_(&mut ns_per_item, 95.0);
+    println!(
+        "SUM,{impl_},{scenario},{median:.3},{:.0},{p95:.3}",
+        1e9 / median
+    );
 }
 
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -675,19 +730,23 @@ fn main() {
     );
 
     let mpmc = mpmc_label_();
-    run_series_(mpmc, "async", &cfg, mpmc_async_);
-    run_series_(mpmc, "try", &cfg, mpmc_try_);
+    if cfg.impls_ != ImplFilter_::Ext {
+        run_series_(mpmc, "async", &cfg, mpmc_async_);
+        run_series_(mpmc, "try", &cfg, mpmc_try_);
+    }
 
-    run_series_("flume", "async", &cfg, flume_async_once_);
-    run_series_("flume", "try", &cfg, flume_try_once_);
+    if cfg.impls_ != ImplFilter_::Mpmc {
+        run_series_("flume", "async", &cfg, flume_async_once_);
+        run_series_("flume", "try", &cfg, flume_try_once_);
 
-    run_series_(
-        "crossbeam-channel",
-        "blocking",
-        &cfg,
-        cb_chan_blocking_once_,
-    );
-    run_series_("crossbeam-channel", "try", &cfg, cb_chan_try_once_);
+        run_series_(
+            "crossbeam-channel",
+            "blocking",
+            &cfg,
+            cb_chan_blocking_once_,
+        );
+        run_series_("crossbeam-channel", "try", &cfg, cb_chan_try_once_);
 
-    run_series_("crossbeam-queue", "spin", &cfg, cb_queue_spin_once_);
+        run_series_("crossbeam-queue", "spin", &cfg, cb_queue_spin_once_);
+    }
 }

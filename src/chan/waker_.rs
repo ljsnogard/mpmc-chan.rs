@@ -37,6 +37,8 @@ use atomic_sync::{
     x_deps::atomex::TrCmpxchOrderings,
 };
 
+use super::metrics_::metric_;
+
 /// 只保护一个 `Option<Waker>` 的互斥锁内存序。
 ///
 /// `SUCC_ORDERING = AcqRel` 同时覆盖两个方向：加锁需要 Acquire，解锁需要
@@ -95,10 +97,16 @@ impl WakerSlot {
         // 「置 waiter 之后、登记 waker 之前」），pending 也已置位，等待方复检时
         // 会立即返回 Ready。
         if self.waiter_.swap(false, Ordering::SeqCst) {
+            metric_!(WAKER_NOTIFY_HIT);
             let waker = self.with_waker_(|slot| slot.take());
-            if let Some(waker) = waker {
-                waker.wake();
+            match waker {
+                Option::Some(waker) => waker.wake(),
+                Option::None => {
+                    metric_!(WAKER_NOTIFY_NO_WAKER);
+                }
             }
+        } else {
+            metric_!(WAKER_NOTIFY_MISS);
         }
     }
 
@@ -108,6 +116,7 @@ impl WakerSlot {
     /// 再复检 pending」。返回 `Ready` 后必须重新检查条件，不能假定条件已成立。
     pub(super) fn poll_wait_(&self, cx: &mut Context<'_>) -> Poll<()> {
         if self.pending_.swap(false, Ordering::SeqCst) {
+            metric_!(WAKER_POLL_READY);
             self.waiter_.store(false, Ordering::SeqCst);
             return Poll::Ready(());
         }

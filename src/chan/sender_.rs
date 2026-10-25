@@ -1,7 +1,11 @@
 //! 生产端句柄与异步发送。
 
 use alloc::sync::Arc;
-use core::{borrow::BorrowMut, sync::atomic::Ordering};
+use core::{borrow::BorrowMut, sync::atomic::Ordering, task::Poll};
+
+
+#[cfg(not(feature = "hybrid"))]
+use super::util_::{CANCEL_CHECK_EVERY, FAST_SPIN_BUDGET};
 
 use abs_cancel::TrCancellationToken;
 use gen_mcf2::gen_may_cancel_future;
@@ -11,6 +15,7 @@ use crate::MpmcBuf;
 use super::{
     core_::MpmcChan,
     error_::{SendError, TrySendError},
+    metrics_::metric_,
     util_::race_cancel_into_,
 };
 
@@ -197,22 +202,84 @@ where
         Result::Err(value) => item = value,
     }
 
+    // P1：方案 C 的快路径失败后先做有界自旋，抓对向刚释放的槽位，避免排队成
+    // 慢写者。每轮仍走 `try_push_fast_` 的读锁，因此有慢写者排队时不会插队；
+    // 只有「写者队列刚排空、对向刚腾出槽位」的窗口才会成功。
+    //
+    // 方案 D 不编译这段：`try_push_fast_` 首次失败就会置拥塞位，失败后自旋必然
+    // 失败（没有可成功窗口），直接走慢路径更省。预算有界；每
+    // `CANCEL_CHECK_EVERY` 次检查取消/关闭，保持取消可观测。
+    #[cfg(not(feature = "hybrid"))]
+    {
+        metric_!(SPIN_PUSH_ENTER);
+        for spin in 0..FAST_SPIN_BUDGET {
+            if spin % CANCEL_CHECK_EVERY == 0 {
+                if cancel.is_cancelled() {
+                    metric_!(PUSH_SLOW_CANCEL);
+                    return Result::Err(SendError::Cancelled(item));
+                }
+                if sender.core_.is_closed_() {
+                    metric_!(PUSH_SLOW_CLOSED);
+                    return Result::Err(SendError::Closed(item));
+                }
+            }
+            match sender.core_.try_push_fast_(item) {
+                Result::Ok(()) => {
+                    metric_!(SPIN_PUSH_OK);
+                    sender.core_.not_empty_.notify_();
+                    return Result::Ok(());
+                }
+                Result::Err(value) => item = value,
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     // 方案 D：进入慢路径前先置拥塞位，挡住后续异步快路径。
     #[cfg(feature = "hybrid")]
     sender.core_.set_prod_congested_();
 
+    metric_!(PUSH_SLOW_ENTER);
+
     // 慢路径：排队为写者，拿到写锁后如果仍满就持锁 park。
     let mut sess = sender.core_.prod_gate_.acquire_session();
-    let Some(result) = race_cancel_into_(&cancel, sess.write_async()).await else {
+    // 默认构建保持原始 `write_async`；只有统计等锁 park 的 metrics 构建才加
+    // 一层 poll_fn，避免为计数给正式路径增加间接调用。
+    #[cfg(mpmc_metrics)]
+    let wait_result = {
+        let mut wait = core::pin::pin!(core::future::IntoFuture::into_future(
+            sess.write_async()
+        ));
+        race_cancel_into_(
+            &cancel,
+            core::future::poll_fn(|cx| {
+                let poll = core::future::Future::poll(wait.as_mut(), cx);
+                match poll {
+                    Poll::Pending => metric_!(PUSH_SLOW_LOCK_PARK),
+                    Poll::Ready(_) => metric_!(PUSH_SLOW_LOCK_READY),
+                }
+                poll
+            }),
+        )
+        .await
+    };
+    #[cfg(not(mpmc_metrics))]
+    let wait_result = race_cancel_into_(&cancel, sess.write_async()).await;
+    let Some(result) = wait_result else {
+        metric_!(PUSH_SLOW_CANCEL);
         return Result::Err(SendError::Cancelled(item));
     };
     let guard = match result {
         Result::Ok(guard) => guard,
-        Result::Err(_) => return Result::Err(SendError::Cancelled(item)),
+        Result::Err(_) => {
+            metric_!(PUSH_SLOW_CANCEL);
+            return Result::Err(SendError::Cancelled(item));
+        }
     };
 
     loop {
         if sender.core_.is_closed_() {
+            metric_!(PUSH_SLOW_CLOSED);
             return Result::Err(SendError::Closed(item));
         }
 
@@ -222,6 +289,7 @@ where
                 // 方案 D：只有拿到写锁（说明没有其他慢生产者排队）才清拥塞位。
                 #[cfg(feature = "hybrid")]
                 sender.core_.clear_prod_congested_();
+                metric_!(PUSH_SLOW_OK);
                 sender.core_.not_empty_.notify_();
                 return Result::Ok(());
             }
@@ -232,10 +300,18 @@ where
         // 取消时 race_cancel_into_ 丢弃等待 future，guard 在返回时释放。
         let notified = race_cancel_into_(
             &cancel,
-            core::future::poll_fn(|cx| sender.core_.not_full_.poll_wait_(cx)),
+            core::future::poll_fn(|cx| {
+                let poll = sender.core_.not_full_.poll_wait_(cx);
+                match poll {
+                    Poll::Pending => metric_!(PUSH_SLOW_PARK),
+                    Poll::Ready(()) => metric_!(PUSH_SLOW_WAKE),
+                }
+                poll
+            }),
         )
         .await;
         if notified.is_none() {
+            metric_!(PUSH_SLOW_CANCEL);
             return Result::Err(SendError::Cancelled(item));
         }
     }

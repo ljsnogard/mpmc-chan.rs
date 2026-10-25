@@ -11,7 +11,9 @@ use atomic_sync::rwlock::cooperative_arena::CooperativeRwLockOwned;
 
 use crate::{MpmcBuf, buf_::Pop_};
 
-use super::{receiver_::Receiver, sender_::Sender, waker_::WakerSlot};
+use super::{
+    metrics_::metric_, receiver_::Receiver, sender_::Sender, waker_::WakerSlot,
+};
 
 /// 快路径出队结果。
 ///
@@ -27,6 +29,16 @@ pub(super) enum TryPop_<T> {
     /// 消费方向锁当前被慢写者/短临界区占用（方案 C），或拥塞位为真（方案 D）；
     /// 调用方应走慢路径。
     Busy,
+}
+
+/// 读锁下的入队结果，供 fast / try 两条路径共用并分别计数。
+enum Push_<T> {
+    /// 入队成功。
+    Ok,
+    /// 拿到读锁但环满。
+    Full(T),
+    /// 方向读锁未拿到。
+    Busy(T),
 }
 
 /// 双锁 MPMC 通道的共享内核。
@@ -170,24 +182,22 @@ where
         self.not_empty_.notify_();
     }
 
-    /// `try_send` 使用的非阻塞快路径：取生产读锁，尝试一次入队。
-    ///
-    /// 这条路径在方案 C / D 下都保留，因为它尊重方向写锁的排队：
-    /// 有慢生产者持有/等待写锁时，`try_send` 返回 would-block，而不是插队。
+    /// 取生产读锁并尝试一次入队；不计数，由 fast / try 调用方分别记账。
     #[inline]
-    pub(super) fn try_push_locked_(&self, item: T) -> Result<(), T> {
+    fn try_push_read_(&self, item: T) -> Push_<T> {
         let mut sess = self.prod_gate_.acquire_session();
         let Result::Ok(_guard) = sess.try_read() else {
-            return Result::Err(item);
+            return Push_::Busy(item);
         };
-        self.buf_.borrow().try_push_(item)
+        match self.buf_.borrow().try_push_(item) {
+            Result::Ok(()) => Push_::Ok,
+            Result::Err(item) => Push_::Full(item),
+        }
     }
 
-    /// `try_recv` 使用的非阻塞快路径：取消费读锁，尝试一次出队。
-    ///
-    /// 返回 [`TryPop_::Busy`] 表示方向锁没拿到，调用方应返回 would-block。
+    /// 取消费读锁并尝试一次出队；不计数，由 fast / try 调用方分别记账。
     #[inline]
-    pub(super) fn try_pop_locked_(&self) -> TryPop_<T> {
+    fn try_pop_read_(&self) -> TryPop_<T> {
         let mut sess = self.cons_gate_.acquire_session();
         let Result::Ok(_guard) = sess.try_read() else {
             return TryPop_::Busy;
@@ -199,18 +209,99 @@ where
         }
     }
 
+    /// `try_send` 使用的非阻塞快路径：取生产读锁，尝试一次入队。
+    ///
+    /// 这条路径在方案 C / D 下都保留，因为它尊重方向写锁的排队：
+    /// 有慢生产者持有/等待写锁时，`try_send` 返回 would-block，而不是插队。
+    #[inline]
+    pub(super) fn try_push_locked_(&self, item: T) -> Result<(), T> {
+        metric_!(PUSH_TRY_ATTEMPT);
+        match self.try_push_read_(item) {
+            Push_::Ok => {
+                metric_!(PUSH_TRY_OK);
+                Result::Ok(())
+            }
+            Push_::Full(item) => {
+                metric_!(PUSH_TRY_FULL);
+                Result::Err(item)
+            }
+            Push_::Busy(item) => {
+                metric_!(PUSH_TRY_BUSY);
+                Result::Err(item)
+            }
+        }
+    }
+
+    /// `try_recv` 使用的非阻塞快路径：取消费读锁，尝试一次出队。
+    ///
+    /// 返回 [`TryPop_::Busy`] 表示方向锁没拿到，调用方应返回 would-block。
+    #[inline]
+    pub(super) fn try_pop_locked_(&self) -> TryPop_<T> {
+        metric_!(POP_TRY_ATTEMPT);
+        match self.try_pop_read_() {
+            TryPop_::Value(value) => {
+                metric_!(POP_TRY_OK);
+                TryPop_::Value(value)
+            }
+            TryPop_::Empty => {
+                metric_!(POP_TRY_EMPTY);
+                TryPop_::Empty
+            }
+            TryPop_::Pending => {
+                metric_!(POP_TRY_PENDING);
+                TryPop_::Pending
+            }
+            TryPop_::Busy => {
+                metric_!(POP_TRY_BUSY);
+                TryPop_::Busy
+            }
+        }
+    }
+
     /// 方案 C：异步快路径与 `try_*` 一样走读锁。
     #[cfg(not(feature = "hybrid"))]
     #[inline]
     pub(super) fn try_push_fast_(&self, item: T) -> Result<(), T> {
-        self.try_push_locked_(item)
+        metric_!(PUSH_FAST_ATTEMPT);
+        match self.try_push_read_(item) {
+            Push_::Ok => {
+                metric_!(PUSH_FAST_OK);
+                Result::Ok(())
+            }
+            Push_::Full(item) => {
+                metric_!(PUSH_FAST_FULL);
+                Result::Err(item)
+            }
+            Push_::Busy(item) => {
+                metric_!(PUSH_FAST_BUSY);
+                Result::Err(item)
+            }
+        }
     }
 
     /// 方案 C：异步快路径与 `try_*` 一样走读锁。
     #[cfg(not(feature = "hybrid"))]
     #[inline]
     pub(super) fn try_pop_fast_(&self) -> TryPop_<T> {
-        self.try_pop_locked_()
+        metric_!(POP_FAST_ATTEMPT);
+        match self.try_pop_read_() {
+            TryPop_::Value(value) => {
+                metric_!(POP_FAST_OK);
+                TryPop_::Value(value)
+            }
+            TryPop_::Empty => {
+                metric_!(POP_FAST_EMPTY);
+                TryPop_::Empty
+            }
+            TryPop_::Pending => {
+                metric_!(POP_FAST_PENDING);
+                TryPop_::Pending
+            }
+            TryPop_::Busy => {
+                metric_!(POP_FAST_BUSY);
+                TryPop_::Busy
+            }
+        }
     }
 
     /// 方案 D：异步生产者快路径不取方向锁，只看拥塞位。
@@ -220,13 +311,19 @@ where
     #[cfg(feature = "hybrid")]
     #[inline]
     pub(super) fn try_push_fast_(&self, item: T) -> Result<(), T> {
+        metric_!(PUSH_FAST_ATTEMPT);
         if self.prod_congested_.load(Ordering::Acquire) {
+            metric_!(PUSH_FAST_BUSY);
             return Result::Err(item);
         }
         match self.buf_.borrow().try_push_(item) {
-            Result::Ok(()) => Result::Ok(()),
+            Result::Ok(()) => {
+                metric_!(PUSH_FAST_OK);
+                Result::Ok(())
+            }
             Result::Err(item) => {
-                self.prod_congested_.store(true, Ordering::Release);
+                metric_!(PUSH_FAST_FULL);
+                self.set_prod_congested_();
                 Result::Err(item)
             }
         }
@@ -236,17 +333,24 @@ where
     #[cfg(feature = "hybrid")]
     #[inline]
     pub(super) fn try_pop_fast_(&self) -> TryPop_<T> {
+        metric_!(POP_FAST_ATTEMPT);
         if self.cons_congested_.load(Ordering::Acquire) {
+            metric_!(POP_FAST_BUSY);
             return TryPop_::Busy;
         }
         match self.buf_.borrow().try_pop_state_() {
-            Pop_::Value(value) => TryPop_::Value(value),
+            Pop_::Value(value) => {
+                metric_!(POP_FAST_OK);
+                TryPop_::Value(value)
+            }
             Pop_::Empty => {
-                self.cons_congested_.store(true, Ordering::Release);
+                metric_!(POP_FAST_EMPTY);
+                self.set_cons_congested_();
                 TryPop_::Empty
             }
             Pop_::Pending => {
-                self.cons_congested_.store(true, Ordering::Release);
+                metric_!(POP_FAST_PENDING);
+                self.set_cons_congested_();
                 TryPop_::Pending
             }
         }
@@ -256,6 +360,13 @@ where
     #[cfg(feature = "hybrid")]
     #[inline]
     pub(super) fn set_prod_congested_(&self) {
+        #[cfg(mpmc_metrics)]
+        {
+            if !self.prod_congested_.swap(true, Ordering::Release) {
+                metric_!(CONGESTED_SET_PROD);
+            }
+        }
+        #[cfg(not(mpmc_metrics))]
         self.prod_congested_.store(true, Ordering::Release);
     }
 
@@ -272,6 +383,9 @@ where
         let mut sess = self.prod_gate_.acquire_session();
         if let Result::Ok(_guard) = sess.try_write() {
             self.prod_congested_.store(false, Ordering::Release);
+            metric_!(CONGESTED_CLEAR_PROD);
+        } else {
+            metric_!(CONGESTED_CLEAR_FAIL_PROD);
         }
     }
 
@@ -279,6 +393,13 @@ where
     #[cfg(feature = "hybrid")]
     #[inline]
     pub(super) fn set_cons_congested_(&self) {
+        #[cfg(mpmc_metrics)]
+        {
+            if !self.cons_congested_.swap(true, Ordering::Release) {
+                metric_!(CONGESTED_SET_CONS);
+            }
+        }
+        #[cfg(not(mpmc_metrics))]
         self.cons_congested_.store(true, Ordering::Release);
     }
 
@@ -292,6 +413,9 @@ where
         let mut sess = self.cons_gate_.acquire_session();
         if let Result::Ok(_guard) = sess.try_write() {
             self.cons_congested_.store(false, Ordering::Release);
+            metric_!(CONGESTED_CLEAR_CONS);
+        } else {
+            metric_!(CONGESTED_CLEAR_FAIL_CONS);
         }
     }
 }

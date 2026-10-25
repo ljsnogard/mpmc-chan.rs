@@ -5,6 +5,7 @@
 
 mod core_;
 mod error_;
+mod metrics_;
 mod receiver_;
 mod sender_;
 mod util_;
