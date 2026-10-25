@@ -3,8 +3,12 @@
 //! 本 crate 的并发骨架是「生产侧 / 消费侧各一把
 //! [`CooperativeRwLock`](atomic_sync::rwlock::cooperative_arena::CooperativeRwLockOwned)」：
 //!
-//! - 快路径取本方向读锁，然后在 [`MpmcBuf`] 的 Vyukov 序列环上 CAS 领取位置；
-//! - 慢路径放弃读锁，改为本方向写锁；拿到写锁后如果仍满/空，就**持写锁 park**，
+//! - 默认（方案 C）快路径取本方向读锁，然后在 [`MpmcBuf`] 的 Vyukov 序列环上
+//!   CAS 领取位置；
+//! - 启用 `hybrid` feature（方案 D）后，`send_async` / `recv_async` 的快路径改为
+//!   「本方向拥塞位 + 无锁 CAS」，不再取读锁；`try_send` / `try_recv` 仍走读锁，
+//!   避免一次失败把拥塞位永久挂住，并保留非阻塞入口对慢写者排队的尊重；
+//! - 慢路径放弃快路径，改为本方向写锁；拿到写锁后如果仍满/空，就**持写锁 park**，
 //!   对向使用另一把锁，因此仍能推进；
 //! - 每方向只有一个 park 者，所以只需要一个单等待者 waker 槽。
 //!

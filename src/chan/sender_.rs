@@ -72,7 +72,7 @@ where
             return Result::Err(TrySendError::Closed(item));
         }
 
-        match self.core_.try_push_fast_(item) {
+        match self.core_.try_push_locked_(item) {
             Result::Ok(()) => {
                 self.core_.not_empty_.notify_();
                 Result::Ok(())
@@ -197,6 +197,10 @@ where
         Result::Err(value) => item = value,
     }
 
+    // 方案 D：进入慢路径前先置拥塞位，挡住后续异步快路径。
+    #[cfg(feature = "hybrid")]
+    sender.core_.set_prod_congested_();
+
     // 慢路径：排队为写者，拿到写锁后如果仍满就持锁 park。
     let mut sess = sender.core_.prod_gate_.acquire_session();
     let Some(result) = race_cancel_into_(&cancel, sess.write_async()).await else {
@@ -215,6 +219,9 @@ where
         match sender.core_.buf_.borrow().try_push_(item) {
             Result::Ok(()) => {
                 drop(guard);
+                // 方案 D：只有拿到写锁（说明没有其他慢生产者排队）才清拥塞位。
+                #[cfg(feature = "hybrid")]
+                sender.core_.clear_prod_congested_();
                 sender.core_.not_empty_.notify_();
                 return Result::Ok(());
             }

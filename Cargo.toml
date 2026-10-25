@@ -11,6 +11,11 @@ license = "AGPL-3.0-or-later"
 #   abs_cancel = { git = "https://gitee.com/lino_snsalias/cancel_rs.git", rev = "..." }
 #   atomic_sync = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git", rev = "..." }
 #   gen_mcf2 = { git = "https://gitee.com/lino_snsalias/cancel_rs.git", rev = "..." }
+[features]
+default = []
+# 方案 D：拥塞位 + 仅 async 慢路径取方向锁。默认关闭（方案 C）。
+hybrid = []
+
 [dependencies]
 abs_cancel = { path = "../cancel_rs/abs_cancel-rs" }
 atomic_sync = { path = "../abs_sync.rs/atomic_sync" }

@@ -4,8 +4,11 @@ An array-based, async-runtime-agnostic, `no_std` MPMC channel with back pressure
 
 ## Design
 
-- **Fast path**: each direction first takes a *read* lock on its own
-  `CooperativeRwLock`, then competes for a slot in a Vyukov bounded sequence ring.
+- **Fast path (default, plan C)**: each direction first takes a *read* lock on its
+  own `CooperativeRwLock`, then competes for a slot in a Vyukov bounded sequence
+  ring. With the `hybrid` feature (plan D), `send_async`/`recv_async` skip the read
+  lock and use a per-direction congestion hint; `try_send`/`try_recv` keep the
+  read-lock path.
 - **Slow path**: if the ring is full/empty (or the direction lock is busy), the
   operation releases the read lock, queues as a **writer** on the same direction
   lock, and — once admitted — parks while **holding** that direction write lock.
@@ -42,10 +45,17 @@ capacity 1 correctly). A borrowed buffer must outlive all senders/receivers/futu
 
 ## Status
 
-- Plan C (read lock every fast-path operation + dual direction locks) is
-  implemented and tested.
-- Plan D (congestion hint + lock only on the slow path) and the benchmark matrix
-  are the next step. See `dev-notes/mpmc-design-20261025-1535.md`.
+- Plan C (read lock every fast-path operation + dual direction locks) is the
+  default and is implemented/tested.
+- Plan D (congestion hint for `send_async`/`recv_async`; `try_*` remain locked)
+  is implemented behind `--features hybrid` and passes the same tests.
+- The benchmark matrix (bare ring vs C vs D) is the next step. See
+  `dev-notes/mpmc-design-20261025-1535.md`.
+
+```sh
+cargo test
+cargo test --features hybrid
+```
 
 ## Platform
 

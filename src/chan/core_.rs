@@ -24,7 +24,8 @@ pub(super) enum TryPop_<T> {
     Empty,
     /// 拿到了消费读锁，头槽已预留但生产者尚未发布；应等待而不是判定关闭。
     Pending,
-    /// 消费方向锁当前被慢写者/短临界区占用，快路径没有进入。
+    /// 消费方向锁当前被慢写者/短临界区占用（方案 C），或拥塞位为真（方案 D）；
+    /// 调用方应走慢路径。
     Busy,
 }
 
@@ -35,10 +36,23 @@ pub(super) enum TryPop_<T> {
 ///
 /// # 锁拓扑
 ///
-/// - `prod_gate_`：只由生产者获取。快路径取读锁；慢路径取写锁并在满时持锁 park。
+/// - `prod_gate_`：只由生产者获取。默认方案 C 下快路径取读锁；方案 D 下
+///   `send_async` 快路径不取锁、只看拥塞位，`try_send` 仍取读锁。慢路径取写锁并在
+///   满时持锁 park。
 /// - `cons_gate_`：只由消费者获取，结构对称。
 ///
 /// 两把锁互不嵌套；发送路径不取消费锁，接收路径不取生产锁。
+///
+/// # 方案 D（`hybrid` feature）
+///
+/// - `send_async` / `recv_async` 快路径只读拥塞位；失败就置位并进入慢路径；
+/// - 慢路径成功后在释放方向写锁后，用一次 `try_write` 检查「是否还有慢者排队」，
+///   只有队列为空才清拥塞位；
+/// - `try_send` / `try_recv` 仍走方向读锁，因此不会被拥塞位卡死，也不插队到
+///   慢写者队列前面。
+///
+/// 方案 D 的公平性是近似的：快路径在拥塞位被置位前已经在途的 CAS 仍可能插队。
+/// 它适合用基准验证是否值得，不应在未测之前替换默认方案 C。
 ///
 /// # Buffer 所有权
 ///
@@ -74,6 +88,12 @@ where
     pub(super) receivers_: AtomicUsize,
     pub(super) tx_closed_: AtomicBool,
     pub(super) rx_closed_: AtomicBool,
+    /// 方案 D 的生产侧拥塞位；默认方案 C 下不编译。
+    #[cfg(feature = "hybrid")]
+    pub(super) prod_congested_: AtomicBool,
+    /// 方案 D 的消费侧拥塞位。
+    #[cfg(feature = "hybrid")]
+    pub(super) cons_congested_: AtomicBool,
     /// 让 `'a` 在 owned buffer（例如 `Box<MpmcBuf>`）时也有使用点。
     pub(super) _lt_: PhantomData<&'a MpmcBuf<T, N>>,
 }
@@ -113,6 +133,10 @@ where
             receivers_: AtomicUsize::new(0),
             tx_closed_: AtomicBool::new(false),
             rx_closed_: AtomicBool::new(false),
+            #[cfg(feature = "hybrid")]
+            prod_congested_: AtomicBool::new(false),
+            #[cfg(feature = "hybrid")]
+            cons_congested_: AtomicBool::new(false),
             _lt_: PhantomData,
         });
 
@@ -146,11 +170,12 @@ where
         self.not_empty_.notify_();
     }
 
-    /// 生产者快路径：取生产读锁，尝试一次入队。
+    /// `try_send` 使用的非阻塞快路径：取生产读锁，尝试一次入队。
     ///
-    /// 失败时把元素原样还回，由调用方决定走慢路径还是返回 would-block。
+    /// 这条路径在方案 C / D 下都保留，因为它尊重方向写锁的排队：
+    /// 有慢生产者持有/等待写锁时，`try_send` 返回 would-block，而不是插队。
     #[inline]
-    pub(super) fn try_push_fast_(&self, item: T) -> Result<(), T> {
+    pub(super) fn try_push_locked_(&self, item: T) -> Result<(), T> {
         let mut sess = self.prod_gate_.acquire_session();
         let Result::Ok(_guard) = sess.try_read() else {
             return Result::Err(item);
@@ -158,12 +183,11 @@ where
         self.buf_.borrow().try_push_(item)
     }
 
-    /// 消费者快路径：取消费读锁，尝试一次出队。
+    /// `try_recv` 使用的非阻塞快路径：取消费读锁，尝试一次出队。
     ///
-    /// 返回 [`TryPop_::Busy`] 表示方向锁没拿到，调用方应走慢路径（即使通道已关闭，
-    /// 也要让慢路径去 drain 可能存在的元素）。
+    /// 返回 [`TryPop_::Busy`] 表示方向锁没拿到，调用方应返回 would-block。
     #[inline]
-    pub(super) fn try_pop_fast_(&self) -> TryPop_<T> {
+    pub(super) fn try_pop_locked_(&self) -> TryPop_<T> {
         let mut sess = self.cons_gate_.acquire_session();
         let Result::Ok(_guard) = sess.try_read() else {
             return TryPop_::Busy;
@@ -172,6 +196,102 @@ where
             Pop_::Value(value) => TryPop_::Value(value),
             Pop_::Empty => TryPop_::Empty,
             Pop_::Pending => TryPop_::Pending,
+        }
+    }
+
+    /// 方案 C：异步快路径与 `try_*` 一样走读锁。
+    #[cfg(not(feature = "hybrid"))]
+    #[inline]
+    pub(super) fn try_push_fast_(&self, item: T) -> Result<(), T> {
+        self.try_push_locked_(item)
+    }
+
+    /// 方案 C：异步快路径与 `try_*` 一样走读锁。
+    #[cfg(not(feature = "hybrid"))]
+    #[inline]
+    pub(super) fn try_pop_fast_(&self) -> TryPop_<T> {
+        self.try_pop_locked_()
+    }
+
+    /// 方案 D：异步生产者快路径不取方向锁，只看拥塞位。
+    ///
+    /// 一旦失败就置拥塞位；后续异步生产者会进入慢路径排队。`try_send` 不走这里，
+    /// 因此不会被这个 hint 永久挡住。
+    #[cfg(feature = "hybrid")]
+    #[inline]
+    pub(super) fn try_push_fast_(&self, item: T) -> Result<(), T> {
+        if self.prod_congested_.load(Ordering::Acquire) {
+            return Result::Err(item);
+        }
+        match self.buf_.borrow().try_push_(item) {
+            Result::Ok(()) => Result::Ok(()),
+            Result::Err(item) => {
+                self.prod_congested_.store(true, Ordering::Release);
+                Result::Err(item)
+            }
+        }
+    }
+
+    /// 方案 D：异步消费者快路径不取方向锁，只看拥塞位。
+    #[cfg(feature = "hybrid")]
+    #[inline]
+    pub(super) fn try_pop_fast_(&self) -> TryPop_<T> {
+        if self.cons_congested_.load(Ordering::Acquire) {
+            return TryPop_::Busy;
+        }
+        match self.buf_.borrow().try_pop_state_() {
+            Pop_::Value(value) => TryPop_::Value(value),
+            Pop_::Empty => {
+                self.cons_congested_.store(true, Ordering::Release);
+                TryPop_::Empty
+            }
+            Pop_::Pending => {
+                self.cons_congested_.store(true, Ordering::Release);
+                TryPop_::Pending
+            }
+        }
+    }
+
+    /// 方案 D：慢路径开始时置生产拥塞位，挡住后续异步快路径。
+    #[cfg(feature = "hybrid")]
+    #[inline]
+    pub(super) fn set_prod_congested_(&self) {
+        self.prod_congested_.store(true, Ordering::Release);
+    }
+
+    /// 方案 D：慢路径成功后尝试清生产拥塞位。
+    ///
+    /// 只有拿到方向写锁才清：`try_write` 要求队列为空，因此还有慢生产者排队/持锁时
+    /// 会失败，拥塞位保持。这样不会让新快路径插到已排队的慢生产者前面。
+    #[cfg(feature = "hybrid")]
+    #[inline]
+    pub(super) fn clear_prod_congested_(&self) {
+        if !self.prod_congested_.load(Ordering::Acquire) {
+            return;
+        }
+        let mut sess = self.prod_gate_.acquire_session();
+        if let Result::Ok(_guard) = sess.try_write() {
+            self.prod_congested_.store(false, Ordering::Release);
+        }
+    }
+
+    /// 方案 D：慢路径开始时置消费拥塞位。
+    #[cfg(feature = "hybrid")]
+    #[inline]
+    pub(super) fn set_cons_congested_(&self) {
+        self.cons_congested_.store(true, Ordering::Release);
+    }
+
+    /// 方案 D：慢路径成功后尝试清消费拥塞位。
+    #[cfg(feature = "hybrid")]
+    #[inline]
+    pub(super) fn clear_cons_congested_(&self) {
+        if !self.cons_congested_.load(Ordering::Acquire) {
+            return;
+        }
+        let mut sess = self.cons_gate_.acquire_session();
+        if let Result::Ok(_guard) = sess.try_write() {
+            self.cons_congested_.store(false, Ordering::Release);
         }
     }
 }

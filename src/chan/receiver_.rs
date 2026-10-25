@@ -69,7 +69,7 @@ where
     /// assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
     /// ```
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        match self.core_.try_pop_fast_() {
+        match self.core_.try_pop_locked_() {
             TryPop_::Value(value) => {
                 self.core_.not_full_.notify_();
                 Result::Ok(value)
@@ -199,6 +199,10 @@ where
         TryPop_::Busy | TryPop_::Pending => {}
     }
 
+    // 方案 D：进入慢路径前先置拥塞位，挡住后续异步快路径。
+    #[cfg(feature = "hybrid")]
+    receiver.core_.set_cons_congested_();
+
     // 慢路径：排队为消费者写者。
     let mut sess = receiver.core_.cons_gate_.acquire_session();
     let Some(result) = race_cancel_into_(&cancel, sess.write_async()).await else {
@@ -213,6 +217,9 @@ where
         match receiver.core_.buf_.borrow().try_pop_state_() {
             Pop_::Value(value) => {
                 drop(guard);
+                // 方案 D：只有拿到写锁（说明没有其他慢消费者排队）才清拥塞位。
+                #[cfg(feature = "hybrid")]
+                receiver.core_.clear_cons_congested_();
                 receiver.core_.not_full_.notify_();
                 return Result::Ok(value);
             }
