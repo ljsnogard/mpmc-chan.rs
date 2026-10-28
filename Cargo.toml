@@ -1,5 +1,5 @@
 [package]
-name = "mpmc-chan"
+name = "mpmc_chan"
 version = "0.1.0"
 edition = "2024"
 description = "Array-based async-runtime-agnostic no_std MPMC channel."
